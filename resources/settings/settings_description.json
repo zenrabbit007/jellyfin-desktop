@@ -149,6 +149,12 @@
         ]
       },
       {
+        "value": "playAllVideosFromLibrary",
+        "display_name": "Play All Videos From Library",
+        "help": "When enabled, playing a video from a library starts a queue with the remaining videos in that library.",
+        "default": false
+      },
+      {
         "value": "ignoreSSLErrors",
         "default": false,
         "hidden": true

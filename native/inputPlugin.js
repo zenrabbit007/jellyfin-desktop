@@ -14,6 +14,10 @@ const remap = {
 }
 
 function playVideosFromLibrary(event, playbackManager) {
+    if (window.jmpInfo?.settings?.main?.playAllVideosFromLibrary === false) {
+        return;
+    }
+
     const actionElement = event.target?.closest?.('[data-action]');
     const action = actionElement?.getAttribute('data-action');
 
