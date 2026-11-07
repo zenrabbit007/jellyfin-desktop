@@ -36,6 +36,35 @@ const getPlugins = () => {
 
 const plugins = getPlugins();
 
+let autoLogoutTimer;
+let playbackActive = false;
+
+function resetAutoLogoutTimer() {
+    clearTimeout(autoLogoutTimer);
+    if (playbackActive) {
+        return;
+    }
+    const timeoutMinutes = Number(jmpInfo.settings.main.autoLogoutMinutes ?? 15);
+    if (!Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
+        return;
+    }
+    autoLogoutTimer = setTimeout(() => {
+        if (typeof window.Dashboard?.logout === 'function') {
+            window.Dashboard.logout();
+        }
+    }, timeoutMinutes * 60 * 1000);
+}
+
+function setPlaybackActive(active) {
+    playbackActive = active;
+    resetAutoLogoutTimer();
+}
+
+['keydown', 'pointerdown', 'pointermove', 'wheel'].forEach((eventName) => {
+    document.addEventListener(eventName, resetAutoLogoutTimer, { passive: true });
+});
+resetAutoLogoutTimer();
+
 // Plugins are bundled, return class directly
 for (const plugin of plugins) {
     window[plugin] = () => {
@@ -58,7 +87,9 @@ window.NativeShell = {
 
     getPlugins() {
         return plugins;
-    }
+    },
+
+    setPlaybackActive
 };
 
 function getDeviceProfile() {
@@ -245,6 +276,11 @@ if (settingsDescriptionsFromStorage) {
 
 jmpInfo.settingsDescriptionsUpdate = [];
 jmpInfo.settingsUpdate = [];
+jmpInfo.settingsUpdate.push((section, data) => {
+    if (section === 'main' && 'autoLogoutMinutes' in data) {
+        resetAutoLogoutTimer();
+    }
+});
 window.apiPromise = createApi();
 window.initCompleted = new Promise(async (resolve) => {
     window.api = await window.apiPromise;

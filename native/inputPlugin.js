@@ -222,6 +222,7 @@ class inputPlugin {
                 });
 
                 window.Events.on(player, 'playing', () => {
+                    window.NativeShell.setPlaybackActive(true);
                     api.player.notifyPlaybackState('Playing');
 
                     updateQueueState();
@@ -258,6 +259,7 @@ class inputPlugin {
                 });
 
                 window.Events.on(player, 'pause', () => {
+                    window.NativeShell.setPlaybackActive(false);
                     api.player.notifyPlaybackState('Paused');
                     api.player.notifyRateChange(0.0);
 
@@ -273,6 +275,7 @@ class inputPlugin {
                 });
 
                 window.Events.on(player, 'playbackstop', () => {
+                    window.NativeShell.setPlaybackActive(false);
                     if (this.durationCheckInterval) {
                         clearInterval(this.durationCheckInterval);
                         this.durationCheckInterval = null;
