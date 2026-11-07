@@ -13,6 +13,79 @@ const remap = {
     "enter": "select",
 }
 
+function playVideosFromLibrary(event, playbackManager) {
+    const actionElement = event.target?.closest?.('[data-action]');
+    const action = actionElement?.getAttribute('data-action');
+
+    if (action !== 'play' && action !== 'resume') {
+        return;
+    }
+
+    const card = actionElement.closest('[data-id][data-serverid][data-mediatype="Video"]');
+
+    if (!card || typeof playbackManager.getItemsForPlayback !== 'function') {
+        return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    const serverId = card.getAttribute('data-serverid');
+    const itemId = card.getAttribute('data-id');
+    const startPositionTicks = action === 'resume' ? Number(card.getAttribute('data-positionticks')) : 0;
+    const parentId = card.getAttribute('data-parentid') ||
+        card.closest('.itemsContainer')?.getAttribute('data-parentid');
+    const routeQuery = window.location.hash.split('?')[1] || '';
+    const routeParams = new URLSearchParams(routeQuery);
+    const routeLibraryId = routeParams.get('topParentId') || routeParams.get('parentId');
+
+    const playSelectedVideo = () => playbackManager.play({
+        ids: [itemId],
+        serverId,
+        startPositionTicks: Number.isFinite(startPositionTicks) ? startPositionTicks : 0
+    });
+
+    playbackManager.getItemsForPlayback(serverId, { ids: [itemId] })
+        .then(itemResult => {
+            const item = itemResult?.Items?.[0];
+            const libraryId = routeLibraryId || parentId || item?.TopParentId || item?.ParentId;
+
+            if (!libraryId) {
+                throw new Error(`Could not determine the library for video ${itemId}.`);
+            }
+
+            return playbackManager.getItemsForPlayback(serverId, {
+                parentId: libraryId,
+                recursive: true,
+                mediaTypes: ['Video'],
+                sortBy: ['SortName'],
+                limit: -1
+            });
+        })
+        .then(result => {
+            const items = result?.Items;
+            const startIndex = items?.findIndex(item => item.Id === itemId);
+
+            if (!Array.isArray(items) || startIndex < 0) {
+                throw new Error(`Video ${itemId} was not found in the library listing.`);
+            }
+
+            const options = { items, startIndex };
+            if (Number.isFinite(startPositionTicks) && startPositionTicks > 0) {
+                options.startPositionTicks = startPositionTicks;
+            }
+
+            return playbackManager.play(options);
+        })
+        .catch(error => {
+            console.error('Input Plugin: Failed to play videos from the library:', error);
+            return playSelectedVideo().catch(playError => {
+                console.error('Input Plugin: Failed to play the selected video:', playError);
+            });
+        });
+}
+
 class inputPlugin {
     constructor({ inputManager, playbackManager }) {
         this.name = 'Input Plugin';
@@ -22,6 +95,8 @@ class inputPlugin {
         this.durationCheckInterval = null;
         this.positionUpdateInterval = null;
         this.attachedPlayer = null;
+        this.videoPlayClickHandler = event => playVideosFromLibrary(event, playbackManager);
+        document.addEventListener('click', this.videoPlayClickHandler, true);
 
         (async () => {
             const api = await window.apiPromise;
@@ -326,6 +401,8 @@ class inputPlugin {
     }
 
     destroy() {
+        document.removeEventListener('click', this.videoPlayClickHandler, true);
+
         if (this.durationCheckInterval) {
             clearInterval(this.durationCheckInterval);
             this.durationCheckInterval = null;
