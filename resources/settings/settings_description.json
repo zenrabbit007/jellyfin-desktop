@@ -150,8 +150,8 @@
       },
       {
         "value": "playAllVideosFromLibrary",
-        "display_name": "Play All Videos From Library",
-        "help": "When enabled, playing a video from a library starts a queue with the remaining videos in that library.",
+        "display_name": "Queue Next Video From Library",
+        "help": "When enabled, playing a video from a library also queues the next video in that library.",
         "default": false
       },
       {

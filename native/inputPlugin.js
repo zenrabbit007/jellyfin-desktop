@@ -13,11 +13,165 @@ const remap = {
     "enter": "select",
 }
 
-function playVideosFromLibrary(event, playbackManager) {
-    if (window.jmpInfo?.settings?.main?.playAllVideosFromLibrary === false) {
+let pendingMusicVideoPageAdvance = null;
+
+function getMusicVideosPlaybackQuery(libraryId, librarySettings, startIndex) {
+    const filters = librarySettings.Filters || {};
+
+    return {
+        parentId: libraryId,
+        recursive: true,
+        includeItemTypes: ['MusicVideo'],
+        sortBy: Array.isArray(librarySettings.SortBy) && librarySettings.SortBy.length
+            ? librarySettings.SortBy
+            : ['SortName'],
+        sortOrder: [librarySettings.SortOrder || 'Ascending'],
+        startIndex,
+        limit: 1,
+        nameLessThan: librarySettings.Alphabet === '#' ? 'A' : undefined,
+        nameStartsWith: librarySettings.Alphabet && librarySettings.Alphabet !== '#'
+            ? librarySettings.Alphabet
+            : undefined,
+        filters: filters.Status,
+        genres: filters.Genres,
+        officialRatings: filters.OfficialRatings,
+        tags: filters.Tags,
+        years: filters.Years,
+        studioIds: filters.StudioIds,
+        audioLanguages: filters.AudioLanguages,
+        subtitleLanguages: filters.SubtitleLanguages,
+        videoTypes: filters.VideoTypes,
+        seriesStatus: filters.SeriesStatus,
+        hasSubtitles: filters.Features?.includes('HasSubtitles') ? true : undefined,
+        hasTrailer: filters.Features?.includes('HasTrailer') ? true : undefined,
+        hasSpecialFeature: filters.Features?.includes('HasSpecialFeature') ? true : undefined,
+        hasThemeSong: filters.Features?.includes('HasThemeSong') ? true : undefined,
+        hasThemeVideo: filters.Features?.includes('HasThemeVideo') ? true : undefined,
+        isHd: filters.VideoBasicFilter?.includes('IsHD')
+            ? true
+            : filters.VideoBasicFilter?.includes('IsSD') ? false : undefined,
+        is4K: filters.VideoBasicFilter?.includes('Is4K') ? true : undefined,
+        is3D: filters.VideoBasicFilter?.includes('Is3D') ? true : undefined
+    };
+}
+
+function getVisibleMusicVideosPageRange(itemsContainer) {
+    const pageLabel = document.querySelector('.MuiToolbar-root.padded-left .MuiChip-label')
+        ?.textContent?.trim();
+    const values = pageLabel?.match(/[\d][\d,.\u00a0\u202f]*/g)
+        ?.map(value => Number(value.replace(/[^\d]/g, '')));
+
+    if (!values || values.length < 3) {
+        return null;
+    }
+
+    for (let start = 0; start < values.length; start++) {
+        for (let end = start + 1; end < values.length; end++) {
+            if (values[start] < 1 || values[end] < values[start]) {
+                continue;
+            }
+
+            const total = values.find((value, index) => (
+                index !== start && index !== end && value >= values[end]
+            ));
+            if (total !== undefined) {
+                return {
+                    startIndex: values[start] - 1,
+                    endIndex: values[end],
+                    total,
+                    label: pageLabel
+                };
+            }
+        }
+    }
+
+    return null;
+}
+
+function advanceMusicVideosPageOnPlayback(playbackManager, playerState) {
+    const pendingAdvance = pendingMusicVideoPageAdvance;
+    if (!pendingAdvance) {
         return;
     }
 
+    const nowPlayingItem = (playerState || playbackManager.getPlayerState())?.NowPlayingItem;
+    console.info('Input Plugin: Checking queued Music Video page advance: ' + JSON.stringify({
+        expectedItemId: pendingAdvance.itemId,
+        currentItemId: nowPlayingItem?.Id || null,
+        libraryId: pendingAdvance.libraryId
+    }));
+    if (nowPlayingItem?.Id !== pendingAdvance.itemId) {
+        return;
+    }
+
+    pendingMusicVideoPageAdvance = null;
+
+    const currentRoute = window.location.hash.split('?')[0];
+    if (currentRoute === '#/video' && pendingAdvance.pageSize > 0) {
+        const settingsKey = `musicvideos - ${pendingAdvance.libraryId}`;
+        const librarySettings = {
+            ShowTitle: true,
+            ShowYear: true,
+            ViewMode: 'grid',
+            ImageType: 'Primary',
+            CardLayout: false,
+            SortBy: ['SortName'],
+            SortOrder: 'Ascending',
+            StartIndex: 0
+        };
+        try {
+            const savedSettings = window.localStorage.getItem(settingsKey);
+            if (savedSettings) {
+                const parsedSettings = JSON.parse(savedSettings);
+                if (!parsedSettings || typeof parsedSettings !== 'object' || Array.isArray(parsedSettings)) {
+                    throw new Error('Stored library settings are not an object.');
+                }
+                Object.assign(librarySettings, parsedSettings);
+            }
+            librarySettings.StartIndex = Math.floor(pendingAdvance.itemIndex / pendingAdvance.pageSize) *
+                pendingAdvance.pageSize;
+            window.localStorage.setItem(settingsKey, JSON.stringify(librarySettings));
+        } catch (error) {
+            console.error('Input Plugin: Could not restore the next Music Videos page:', error);
+        }
+
+        console.info('Input Plugin: Saved the Music Videos page containing the queued video.');
+    }
+
+    const nextItemIndex = pendingAdvance.itemIndex + 1;
+    Promise.resolve()
+        .then(() => playbackManager.getItemsForPlayback(
+            pendingAdvance.serverId,
+            getMusicVideosPlaybackQuery(pendingAdvance.libraryId, pendingAdvance.librarySettings, nextItemIndex)
+        ))
+        .then(result => {
+            const nextId = result?.Items?.[0]?.Id;
+            if (!nextId) {
+                console.info('Input Plugin: No further Music Video is available to queue.');
+                return false;
+            }
+
+            pendingMusicVideoPageAdvance = {
+                ...pendingAdvance,
+                itemId: nextId,
+                itemIndex: nextItemIndex
+            };
+            return playbackManager.queueNext({
+                ids: [nextId],
+                serverId: pendingAdvance.serverId
+            }).then(() => true);
+        })
+        .then(queued => {
+            if (queued) {
+                console.info('Input Plugin: Queued the following Music Video.');
+            }
+        })
+        .catch(error => {
+            console.error('Input Plugin: Failed to queue the following Music Video:', error);
+        });
+}
+
+function playVideosFromLibrary(event, playbackManager) {
     const actionElement = event.target?.closest?.('[data-action]');
     const action = actionElement?.getAttribute('data-action');
 
@@ -25,9 +179,145 @@ function playVideosFromLibrary(event, playbackManager) {
         return;
     }
 
-    const card = actionElement.closest('[data-id][data-serverid][data-mediatype="Video"]');
+    pendingMusicVideoPageAdvance = null;
 
-    if (!card || typeof playbackManager.getItemsForPlayback !== 'function') {
+    if (window.jmpInfo?.settings?.main?.playAllVideosFromLibrary === false) {
+        console.warn('Input Plugin: Library queue setting is disabled.');
+        return;
+    }
+
+    console.warn('Input Plugin: Detected a Play/Resume click: ' + JSON.stringify({
+        action,
+        setting: window.jmpInfo?.settings?.main?.playAllVideosFromLibrary
+    }));
+
+    const card = actionElement.closest('[data-id][data-serverid][data-mediatype="Video"]');
+    const itemsContainer = card?.closest('.itemsContainer');
+
+    if (!card || !itemsContainer) {
+        console.warn('Input Plugin: Could not handle video play click.', {
+            cardFound: !!card,
+            itemsContainerFound: !!itemsContainer
+        });
+        return;
+    }
+
+    const siblingCards = itemsContainer.querySelectorAll('[data-id][data-serverid][data-mediatype="Video"]');
+    const cardIndex = siblingCards ? Array.prototype.indexOf.call(siblingCards, card) : -1;
+
+    if (cardIndex < 0) {
+        console.warn('Input Plugin: Clicked video was not found in its library item list.', {
+            visibleVideoCount: siblingCards?.length || 0
+        });
+        return;
+    }
+
+    let nextVideoCard = null;
+    for (let i = cardIndex + 1; i < siblingCards.length; i++) {
+        if (siblingCards[i].getAttribute('data-mediatype') === 'Video') {
+            nextVideoCard = siblingCards[i];
+            break;
+        }
+    }
+
+    let nextVideoId = nextVideoCard?.getAttribute('data-id');
+    let nextVideoPromise;
+    let musicVideoNextIndex;
+
+    const routeQuery = window.location.hash.split('?')[1] || window.location.search.slice(1);
+    const routeParams = new URLSearchParams(routeQuery);
+    const libraryId = routeParams.get('topParentId') || routeParams.get('parentId') ||
+        itemsContainer.getAttribute('data-parentid');
+    const modernLibraryPage = itemsContainer.closest('.libraryPage');
+    const isMusicVideosPage = card.getAttribute('data-context') === 'musicvideos' ||
+        modernLibraryPage?.id === 'musicvideos' ||
+        /(?:^|\/)musicvideos(?:[?#]|$)/.test(
+            `${window.location.pathname}${window.location.hash}`
+        ) && routeParams.get('tab') === '2';
+    const savedSettings = isMusicVideosPage
+        ? window.localStorage.getItem(`musicvideos - ${libraryId}`)
+        : null;
+    let librarySettings = {};
+    if (savedSettings) {
+        try {
+            const parsedSettings = JSON.parse(savedSettings);
+            if (parsedSettings && typeof parsedSettings === 'object' && !Array.isArray(parsedSettings)) {
+                librarySettings = parsedSettings;
+            } else {
+                throw new Error('Stored library settings are not an object.');
+            }
+        } catch (error) {
+            console.error('Input Plugin: Could not read Music Videos library view settings:', error);
+        }
+    }
+
+    const visiblePageRange = isMusicVideosPage
+        ? getVisibleMusicVideosPageRange(itemsContainer)
+        : null;
+    const pageStartIndex = visiblePageRange?.startIndex ?? (Number(librarySettings.StartIndex) || 0);
+    const musicVideosPageSize = siblingCards.length;
+    if (isMusicVideosPage && nextVideoId) {
+        musicVideoNextIndex = pageStartIndex + cardIndex + 1;
+    }
+
+    if (!nextVideoId) {
+        const pagingText = itemsContainer.parentNode?.querySelector('.paging')?.textContent || '';
+        const pageRange = pagingText.match(/([\d,.\u00a0\u202f]+)\s*[-–]\s*([\d,.\u00a0\u202f]+)/);
+        const legacyPageEnd = pageRange ? Number(pageRange[2].replace(/[^\d]/g, '')) : 0;
+        const pageEnd = isMusicVideosPage
+            ? visiblePageRange?.endIndex ?? pageStartIndex + siblingCards.length
+            : legacyPageEnd;
+        const hasNextPage = isMusicVideosPage
+            ? visiblePageRange?.total !== undefined
+                ? pageEnd < visiblePageRange.total
+                : pageEnd > 0
+            : !!itemsContainer.parentNode?.querySelector('.paging .btnNextPage:not([disabled])');
+
+        console.info('Input Plugin: Looking for the next library video: ' + JSON.stringify({
+            isMusicVideosPage,
+            route: `${window.location.pathname}${window.location.hash}`,
+            libraryFound: !!libraryId,
+            storedPageStart: librarySettings.StartIndex,
+            visiblePageRange: visiblePageRange?.label || null,
+            pageStart: pageStartIndex,
+            visibleVideoCount: siblingCards.length,
+            clickedVideoIndex: cardIndex,
+            nextPageOffset: pageEnd,
+            hasNextPage
+        }));
+
+        if (hasNextPage && pageEnd > 0 && libraryId &&
+            typeof playbackManager.getItemsForPlayback === 'function') {
+            const query = isMusicVideosPage
+                ? getMusicVideosPlaybackQuery(libraryId, librarySettings, pageEnd)
+                : {
+                    parentId: libraryId,
+                    recursive: true,
+                    mediaTypes: ['Video'],
+                    sortBy: ['SortName', 'ProductionYear'],
+                    sortOrder: ['Ascending'],
+                    startIndex: pageEnd,
+                    limit: 1
+                };
+
+            nextVideoPromise = Promise.resolve()
+                .then(() => playbackManager.getItemsForPlayback(card.getAttribute('data-serverid'), query))
+                .then(result => {
+                    const nextId = result?.Items?.[0]?.Id;
+                    if (!nextId) {
+                        console.warn('Input Plugin: The next-page lookup returned no video.');
+                    } else {
+                        console.info('Input Plugin: Next-page lookup found a video.');
+                        if (isMusicVideosPage) {
+                            musicVideoNextIndex = pageEnd;
+                        }
+                    }
+                    return nextId;
+                });
+        }
+    }
+
+    if (!nextVideoId && !nextVideoPromise) {
         return;
     }
 
@@ -38,55 +328,46 @@ function playVideosFromLibrary(event, playbackManager) {
     const serverId = card.getAttribute('data-serverid');
     const itemId = card.getAttribute('data-id');
     const startPositionTicks = action === 'resume' ? Number(card.getAttribute('data-positionticks')) : 0;
-    const parentId = card.getAttribute('data-parentid') ||
-        card.closest('.itemsContainer')?.getAttribute('data-parentid');
-    const routeQuery = window.location.hash.split('?')[1] || '';
-    const routeParams = new URLSearchParams(routeQuery);
-    const routeLibraryId = routeParams.get('topParentId') || routeParams.get('parentId');
 
-    const playSelectedVideo = () => playbackManager.play({
+    const playPromise = Promise.resolve().then(() => playbackManager.play({
         ids: [itemId],
         serverId,
         startPositionTicks: Number.isFinite(startPositionTicks) ? startPositionTicks : 0
+    }));
+
+    playPromise.catch(error => {
+        console.error('Input Plugin: Failed to play the selected video:', error);
     });
 
-    playbackManager.getItemsForPlayback(serverId, { ids: [itemId] })
-        .then(itemResult => {
-            const item = itemResult?.Items?.[0];
-            const libraryId = routeLibraryId || parentId || item?.TopParentId || item?.ParentId;
-
-            if (!libraryId) {
-                throw new Error(`Could not determine the library for video ${itemId}.`);
+    Promise.resolve(nextVideoId || nextVideoPromise)
+        .then(nextId => {
+            if (!nextId) {
+                console.warn('Input Plugin: No next video was found in the library.');
+                return;
             }
 
-            return playbackManager.getItemsForPlayback(serverId, {
-                parentId: libraryId,
-                recursive: true,
-                mediaTypes: ['Video'],
-                sortBy: ['SortName'],
-                limit: -1
+            return playPromise.then(() => {
+                if (isMusicVideosPage && libraryId && Number.isInteger(musicVideoNextIndex)) {
+                    pendingMusicVideoPageAdvance = {
+                        itemId: nextId,
+                        libraryId,
+                        itemIndex: musicVideoNextIndex,
+                        pageSize: musicVideosPageSize,
+                        librarySettings,
+                        serverId
+                    };
+                }
+
+                return playbackManager.queueNext({
+                    ids: [nextId],
+                    serverId
+                });
+            }).then(() => {
+                console.info('Input Plugin: Queued the next library video.');
             });
-        })
-        .then(result => {
-            const items = result?.Items;
-            const startIndex = items?.findIndex(item => item.Id === itemId);
-
-            if (!Array.isArray(items) || startIndex < 0) {
-                throw new Error(`Video ${itemId} was not found in the library listing.`);
-            }
-
-            const options = { items, startIndex };
-            if (Number.isFinite(startPositionTicks) && startPositionTicks > 0) {
-                options.startPositionTicks = startPositionTicks;
-            }
-
-            return playbackManager.play(options);
         })
         .catch(error => {
-            console.error('Input Plugin: Failed to play videos from the library:', error);
-            return playSelectedVideo().catch(playError => {
-                console.error('Input Plugin: Failed to play the selected video:', playError);
-            });
+            console.error('Input Plugin: Failed to queue the next library video:', error);
         });
 }
 
@@ -99,6 +380,7 @@ class inputPlugin {
         this.durationCheckInterval = null;
         this.positionUpdateInterval = null;
         this.attachedPlayer = null;
+        console.warn('Input Plugin: Click handler initialized.');
         this.videoPlayClickHandler = event => playVideosFromLibrary(event, playbackManager);
         document.addEventListener('click', this.videoPlayClickHandler, true);
 
@@ -234,7 +516,10 @@ class inputPlugin {
 
                 window.Events.on(playbackManager, 'playlistitemremove', updateQueueState);
                 window.Events.on(playbackManager, 'playlistitemadd', updateQueueState);
-                window.Events.on(playbackManager, 'playlistitemchange', updateQueueState);
+                window.Events.on(playbackManager, 'playlistitemchange', () => {
+                    advanceMusicVideosPageOnPlayback(playbackManager);
+                    updateQueueState();
+                });
 
                 window.Events.on(playbackManager, 'playbackstop', function(e, playbackStopInfo) {
                     updateQueueState();
@@ -246,10 +531,11 @@ class inputPlugin {
                 globalListenersAttached = true;
             }
 
-            window.Events.on(playbackManager, 'playbackstart', (e, player) => {
+            window.Events.on(playbackManager, 'playbackstart', (e, player, state) => {
                 if (!player) return;
 
-                const state = playbackManager.getPlayerState();
+                state = state || playbackManager.getPlayerState(player);
+                advanceMusicVideosPageOnPlayback(playbackManager, state);
                 if (state && state.NowPlayingItem) {
                     api.player.notifyMetadata(state.NowPlayingItem);
 
