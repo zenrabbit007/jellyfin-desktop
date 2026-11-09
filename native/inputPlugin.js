@@ -89,7 +89,7 @@ function getVisibleMusicVideosPageRange(itemsContainer) {
     return null;
 }
 
-function returnToMusicVideosLibrary(event) {
+function returnToMusicVideosLibrary(event, playbackManager) {
     const pendingReturn = pendingMusicVideoReturn;
     if (!pendingReturn?.libraryRoute || window.location.hash.split('?')[0] !== '#/video') {
         return;
@@ -101,10 +101,22 @@ function returnToMusicVideosLibrary(event) {
         return;
     }
 
+    const playerState = playbackManager.getPlayerState();
+    const currentItemId = playerState?.NowPlayingItem?.Id;
+    if (pendingMusicVideoPageAdvance?.itemId === currentItemId) {
+        advanceMusicVideosPageOnPlayback(playbackManager, playerState);
+    }
+
+    console.info('Input Plugin: Returning from the active Music Video: ' + JSON.stringify({
+        currentItemId: currentItemId || null,
+        savedItemId: pendingMusicVideoReturn?.itemId || null,
+        currentIndex: pendingMusicVideoReturn?.itemIndex ?? null,
+        targetStartIndex: pendingMusicVideoReturn?.startIndex ?? null
+    }));
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    window.location.hash = pendingReturn.libraryRoute;
+    window.location.hash = pendingMusicVideoReturn?.libraryRoute || pendingReturn.libraryRoute;
     console.info('Input Plugin: Returning to the Music Videos library from the video control.');
 }
 
@@ -145,8 +157,22 @@ function advanceMusicVideosLibraryPageOnReturn(pendingReturn) {
 
         const visibleRange = getVisibleMusicVideosPageRange();
         if (visibleRange?.startIndex === pendingReturn.startIndex) {
+            const activeCard = Array.from(document.querySelectorAll('.card[data-id], .listItem[data-id]'))
+                .find(card => card.getAttribute('data-id') === pendingReturn.itemId);
+            if (activeCard) {
+                if (!activeCard.hasAttribute('tabindex')) {
+                    activeCard.setAttribute('tabindex', '-1');
+                }
+                activeCard.focus();
+                activeCard.scrollIntoView({ block: 'center', inline: 'nearest' });
+            } else {
+                console.warn('Input Plugin: Could not find the active Music Video in the restored library page.', {
+                    itemId: pendingReturn.itemId,
+                    startIndex: pendingReturn.startIndex
+                });
+            }
             pendingMusicVideoReturn = null;
-            console.info('Input Plugin: Returned to the Music Videos page containing the queued video.');
+            console.info('Input Plugin: Returned to the active Music Video in the library.');
             return;
         }
 
@@ -248,6 +274,8 @@ function advanceMusicVideosPageOnPlayback(playbackManager, playerState) {
             pendingMusicVideoReturn = {
                 libraryId: pendingAdvance.libraryId,
                 libraryRoute: pendingAdvance.libraryRoute,
+                itemId: pendingAdvance.itemId,
+                itemIndex: pendingAdvance.itemIndex,
                 startIndex: librarySettings.StartIndex,
                 pageChecks: 0,
                 pageCheckScheduled: false,
@@ -378,8 +406,9 @@ function playVideosFromLibrary(event, playbackManager) {
         : null;
     const pageStartIndex = visiblePageRange?.startIndex ?? (Number(librarySettings.StartIndex) || 0);
     const musicVideosPageSize = siblingCards.length;
+    const musicVideoCurrentIndex = pageStartIndex + cardIndex;
     if (isMusicVideosPage && nextVideoId) {
-        musicVideoNextIndex = pageStartIndex + cardIndex + 1;
+        musicVideoNextIndex = musicVideoCurrentIndex + 1;
     }
 
     if (!nextVideoId) {
@@ -451,6 +480,19 @@ function playVideosFromLibrary(event, playbackManager) {
     const itemId = card.getAttribute('data-id');
     const startPositionTicks = action === 'resume' ? Number(card.getAttribute('data-positionticks')) : 0;
 
+    if (isMusicVideosPage && libraryId && musicVideosPageSize > 0) {
+        pendingMusicVideoReturn = {
+            libraryId,
+            libraryRoute: window.location.hash,
+            itemId,
+            itemIndex: musicVideoCurrentIndex,
+            startIndex: Math.floor(musicVideoCurrentIndex / musicVideosPageSize) * musicVideosPageSize,
+            pageChecks: 0,
+            pageCheckScheduled: false,
+            pageChangeRequested: false
+        };
+    }
+
     const playPromise = Promise.resolve().then(() => playbackManager.play({
         ids: [itemId],
         serverId,
@@ -503,7 +545,7 @@ class inputPlugin {
         this.durationCheckInterval = null;
         this.positionUpdateInterval = null;
         this.attachedPlayer = null;
-        this.videoBackHandler = event => returnToMusicVideosLibrary(event);
+        this.videoBackHandler = event => returnToMusicVideosLibrary(event, playbackManager);
         this.musicVideoReturnHandler = () => {
             window.setTimeout(refreshMusicVideosLibraryOnReturn, 100);
         };
