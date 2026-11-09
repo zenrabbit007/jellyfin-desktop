@@ -14,6 +14,7 @@ const remap = {
 }
 
 let pendingMusicVideoPageAdvance = null;
+let pendingMusicVideoReturn = null;
 
 function getMusicVideosPlaybackQuery(libraryId, librarySettings, startIndex) {
     const filters = librarySettings.Filters || {};
@@ -88,6 +89,116 @@ function getVisibleMusicVideosPageRange(itemsContainer) {
     return null;
 }
 
+function returnToMusicVideosLibrary(event) {
+    const pendingReturn = pendingMusicVideoReturn;
+    if (!pendingReturn?.libraryRoute || window.location.hash.split('?')[0] !== '#/video') {
+        return;
+    }
+
+    const backButton = event.target?.closest?.('.videoOsd-appBar button');
+    const toolbar = backButton?.closest('.videoOsd-appBar');
+    if (!backButton || toolbar?.querySelector('button') !== backButton) {
+        return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    window.location.hash = pendingReturn.libraryRoute;
+    console.info('Input Plugin: Returning to the Music Videos library from the video control.');
+}
+
+function refreshMusicVideosLibraryOnReturn() {
+    const pendingReturn = pendingMusicVideoReturn;
+    if (!pendingReturn) {
+        return;
+    }
+
+    const route = window.location.hash;
+    const routeParams = new URLSearchParams(route.split('?')[1] || '');
+    if (!/(?:^|#\/)musicvideos(?:[?#]|$)/.test(route) ||
+        routeParams.get('topParentId') !== pendingReturn.libraryId) {
+        return;
+    }
+
+    window.dispatchEvent(new StorageEvent('local-storage', {
+        key: `musicvideos - ${pendingReturn.libraryId}`
+    }));
+    console.info('Input Plugin: Refreshed Music Videos library settings after returning from video.');
+    advanceMusicVideosLibraryPageOnReturn(pendingReturn);
+}
+
+function advanceMusicVideosLibraryPageOnReturn(pendingReturn) {
+    if (pendingReturn !== pendingMusicVideoReturn || pendingReturn.pageCheckScheduled) {
+        return;
+    }
+
+    pendingReturn.pageCheckScheduled = true;
+    window.setTimeout(() => {
+        pendingReturn.pageCheckScheduled = false;
+        const currentRoute = window.location.hash;
+        const routeParams = new URLSearchParams(currentRoute.split('?')[1] || '');
+        if (!/(?:^|#\/)musicvideos(?:[?#]|$)/.test(currentRoute) ||
+            routeParams.get('topParentId') !== pendingReturn.libraryId) {
+            return;
+        }
+
+        const visibleRange = getVisibleMusicVideosPageRange();
+        if (visibleRange?.startIndex === pendingReturn.startIndex) {
+            pendingMusicVideoReturn = null;
+            console.info('Input Plugin: Returned to the Music Videos page containing the queued video.');
+            return;
+        }
+
+        if (pendingReturn.pageChecks >= 40) {
+            console.error('Input Plugin: Could not advance to the Music Videos page containing the queued video.', {
+                expectedStartIndex: pendingReturn.startIndex,
+                visibleRange: visibleRange?.label || null
+            });
+            pendingMusicVideoReturn = null;
+            return;
+        }
+
+        if (!visibleRange) {
+            if (pendingReturn.pageChecks === 0) {
+                console.warn('Input Plugin: Waiting for the Music Videos page range to appear after returning.');
+            }
+        } else if (!pendingReturn.pageChangeRequested) {
+            const isPreviousPage = visibleRange.startIndex > pendingReturn.startIndex;
+            const expectedLabel = isPreviousPage ? 'Previous' : 'Next';
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const paginationButton = buttons.find(button => (
+                [button.title, button.getAttribute('aria-label')]
+                    .some(label => label?.trim().toLowerCase() === expectedLabel.toLowerCase())
+            ));
+
+            if (pendingReturn.pageChecks === 0) {
+                console.info('Input Plugin: Checking Music Videos return pagination: ' + JSON.stringify({
+                    expectedStartIndex: pendingReturn.startIndex,
+                    visibleRange: visibleRange.label,
+                    buttonCount: buttons.length,
+                    buttonLabels: buttons
+                        .map(button => button.title || button.getAttribute('aria-label') || '')
+                        .filter(Boolean)
+                        .slice(-12),
+                    paginationLabel: expectedLabel,
+                    paginationButtonFound: !!paginationButton,
+                    paginationButtonDisabled: paginationButton?.disabled ?? null
+                }));
+            }
+
+            if (paginationButton && !paginationButton.disabled) {
+                pendingReturn.pageChangeRequested = true;
+                paginationButton.click();
+                console.info('Input Plugin: Requested the Music Videos pagination control to show the queued video page.');
+            }
+        }
+
+        pendingReturn.pageChecks++;
+        window.setTimeout(() => advanceMusicVideosLibraryPageOnReturn(pendingReturn), 250);
+    }, 250);
+}
+
 function advanceMusicVideosPageOnPlayback(playbackManager, playerState) {
     const pendingAdvance = pendingMusicVideoPageAdvance;
     if (!pendingAdvance) {
@@ -131,6 +242,17 @@ function advanceMusicVideosPageOnPlayback(playbackManager, playerState) {
             librarySettings.StartIndex = Math.floor(pendingAdvance.itemIndex / pendingAdvance.pageSize) *
                 pendingAdvance.pageSize;
             window.localStorage.setItem(settingsKey, JSON.stringify(librarySettings));
+            window.dispatchEvent(new CustomEvent('local-storage', {
+                detail: { key: settingsKey }
+            }));
+            pendingMusicVideoReturn = {
+                libraryId: pendingAdvance.libraryId,
+                libraryRoute: pendingAdvance.libraryRoute,
+                startIndex: librarySettings.StartIndex,
+                pageChecks: 0,
+                pageCheckScheduled: false,
+                pageChangeRequested: false
+            };
         } catch (error) {
             console.error('Input Plugin: Could not restore the next Music Videos page:', error);
         }
@@ -354,7 +476,8 @@ function playVideosFromLibrary(event, playbackManager) {
                         itemIndex: musicVideoNextIndex,
                         pageSize: musicVideosPageSize,
                         librarySettings,
-                        serverId
+                        serverId,
+                        libraryRoute: window.location.hash
                     };
                 }
 
@@ -380,6 +503,13 @@ class inputPlugin {
         this.durationCheckInterval = null;
         this.positionUpdateInterval = null;
         this.attachedPlayer = null;
+        this.videoBackHandler = event => returnToMusicVideosLibrary(event);
+        this.musicVideoReturnHandler = () => {
+            window.setTimeout(refreshMusicVideosLibraryOnReturn, 100);
+        };
+        window.addEventListener('hashchange', this.musicVideoReturnHandler);
+        document.addEventListener('viewshow', this.musicVideoReturnHandler, true);
+        document.addEventListener('click', this.videoBackHandler, true);
         console.warn('Input Plugin: Click handler initialized.');
         this.videoPlayClickHandler = event => playVideosFromLibrary(event, playbackManager);
         document.addEventListener('click', this.videoPlayClickHandler, true);
@@ -692,6 +822,9 @@ class inputPlugin {
 
     destroy() {
         document.removeEventListener('click', this.videoPlayClickHandler, true);
+        document.removeEventListener('click', this.videoBackHandler, true);
+        window.removeEventListener('hashchange', this.musicVideoReturnHandler);
+        document.removeEventListener('viewshow', this.musicVideoReturnHandler, true);
 
         if (this.durationCheckInterval) {
             clearInterval(this.durationCheckInterval);
