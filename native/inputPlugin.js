@@ -16,7 +16,7 @@ const remap = {
 let pendingMusicVideoPageAdvance = null;
 let pendingMusicVideoReturn = null;
 
-function getMusicVideosPlaybackQuery(libraryId, librarySettings, startIndex) {
+function getMusicVideosPlaybackQuery(libraryId, librarySettings, startIndex, limit = 1) {
     const filters = librarySettings.Filters || {};
 
     return {
@@ -28,7 +28,7 @@ function getMusicVideosPlaybackQuery(libraryId, librarySettings, startIndex) {
             : ['SortName'],
         sortOrder: [librarySettings.SortOrder || 'Ascending'],
         startIndex,
-        limit: 1,
+        limit,
         nameLessThan: librarySettings.Alphabet === '#' ? 'A' : undefined,
         nameStartsWith: librarySettings.Alphabet && librarySettings.Alphabet !== '#'
             ? librarySettings.Alphabet
@@ -54,6 +54,19 @@ function getMusicVideosPlaybackQuery(libraryId, librarySettings, startIndex) {
         is4K: filters.VideoBasicFilter?.includes('Is4K') ? true : undefined,
         is3D: filters.VideoBasicFilter?.includes('Is3D') ? true : undefined
     };
+}
+
+function getItemIdsAfterAnchor(items, anchorId) {
+    if (!Array.isArray(items)) {
+        return [];
+    }
+
+    const anchorIndex = items.findIndex(item => item.Id === anchorId);
+    if (anchorIndex < 0) {
+        return [];
+    }
+
+    return items.slice(anchorIndex + 1).map(item => item.Id).filter(Boolean);
 }
 
 function getVisibleMusicVideosPageRange(itemsContainer) {
@@ -265,8 +278,7 @@ function advanceMusicVideosPageOnPlayback(playbackManager, playerState) {
                 }
                 Object.assign(librarySettings, parsedSettings);
             }
-            librarySettings.StartIndex = Math.floor(pendingAdvance.itemIndex / pendingAdvance.pageSize) *
-                pendingAdvance.pageSize;
+            librarySettings.StartIndex = pendingAdvance.pageStartIndex;
             window.localStorage.setItem(settingsKey, JSON.stringify(librarySettings));
             window.dispatchEvent(new CustomEvent('local-storage', {
                 detail: { key: settingsKey }
@@ -289,32 +301,70 @@ function advanceMusicVideosPageOnPlayback(playbackManager, playerState) {
     }
 
     const nextItemIndex = pendingAdvance.itemIndex + 1;
+    const pageOffset = nextItemIndex - pendingAdvance.pageStartIndex;
+    const queueMusicVideo = (nextId, pageStartIndex, pageItemIds) => {
+        if (!nextId) {
+            return;
+        }
+
+        const nextAdvance = {
+            ...pendingAdvance,
+            itemId: nextId,
+            itemIndex: nextItemIndex,
+            pageStartIndex,
+            pageItemIds
+        };
+        pendingMusicVideoPageAdvance = nextAdvance;
+        return playbackManager.queueNext({
+            ids: [nextId],
+            serverId: pendingAdvance.serverId
+        }).catch(error => {
+            if (pendingMusicVideoPageAdvance === nextAdvance) {
+                pendingMusicVideoPageAdvance = null;
+            }
+            throw error;
+        });
+    };
+
+    if (pageOffset >= 0 && pageOffset < pendingAdvance.pageItemIds.length) {
+        queueMusicVideo(
+            pendingAdvance.pageItemIds[pageOffset],
+            pendingAdvance.pageStartIndex,
+            pendingAdvance.pageItemIds
+        ).catch(error => {
+            console.error('Input Plugin: Failed to queue the following Music Video:', error);
+        });
+        return;
+    }
+
+    const nextPageStartIndex = pendingAdvance.pageStartIndex + pendingAdvance.pageItemIds.length;
+    const pageAnchorId = pendingAdvance.pageItemIds[pendingAdvance.pageItemIds.length - 1];
     Promise.resolve()
         .then(() => playbackManager.getItemsForPlayback(
             pendingAdvance.serverId,
-            getMusicVideosPlaybackQuery(pendingAdvance.libraryId, pendingAdvance.librarySettings, nextItemIndex)
+            getMusicVideosPlaybackQuery(
+                pendingAdvance.libraryId,
+                pendingAdvance.librarySettings,
+                nextPageStartIndex - 1,
+                pendingAdvance.pageSize + 1
+            )
         ))
         .then(result => {
-            const nextId = result?.Items?.[0]?.Id;
-            if (!nextId) {
-                console.info('Input Plugin: No further Music Video is available to queue.');
-                return false;
+            const resultItems = result?.Items || [];
+            const anchorIndex = resultItems.findIndex(item => item.Id === pageAnchorId);
+            const pageItemIds = getItemIdsAfterAnchor(resultItems, pageAnchorId);
+            if (!pageItemIds.length && resultItems.length) {
+                console.error('Input Plugin: Could not find the previous page anchor in the next-page lookup; refusing to guess the next video.', {
+                    pageAnchorId,
+                    lookupStartIndex: nextPageStartIndex - 1,
+                    responseStartIndex: result?.StartIndex ?? null,
+                    firstResultId: resultItems[0]?.Id || null
+                });
             }
-
-            pendingMusicVideoPageAdvance = {
-                ...pendingAdvance,
-                itemId: nextId,
-                itemIndex: nextItemIndex
-            };
-            return playbackManager.queueNext({
-                ids: [nextId],
-                serverId: pendingAdvance.serverId
-            }).then(() => true);
-        })
-        .then(queued => {
-            if (queued) {
-                console.info('Input Plugin: Queued the following Music Video.');
-            }
+            const actualNextPageStartIndex = anchorIndex < 0
+                ? nextPageStartIndex
+                : (result?.StartIndex ?? nextPageStartIndex - 1) + anchorIndex + 1;
+            return queueMusicVideo(pageItemIds[0], actualNextPageStartIndex, pageItemIds);
         })
         .catch(error => {
             console.error('Input Plugin: Failed to queue the following Music Video:', error);
@@ -373,6 +423,7 @@ function playVideosFromLibrary(event, playbackManager) {
     let nextVideoId = nextVideoCard?.getAttribute('data-id');
     let nextVideoPromise;
     let musicVideoNextIndex;
+    let musicVideoNextPageIds;
 
     const routeQuery = window.location.hash.split('?')[1] || window.location.search.slice(1);
     const routeParams = new URLSearchParams(routeQuery);
@@ -406,6 +457,10 @@ function playVideosFromLibrary(event, playbackManager) {
         : null;
     const pageStartIndex = visiblePageRange?.startIndex ?? (Number(librarySettings.StartIndex) || 0);
     const musicVideosPageSize = siblingCards.length;
+    const musicVideoPageItemIds = Array.from(
+        siblingCards,
+        sibling => sibling.getAttribute('data-id')
+    );
     const musicVideoCurrentIndex = pageStartIndex + cardIndex;
     if (isMusicVideosPage && nextVideoId) {
         musicVideoNextIndex = musicVideoCurrentIndex + 1;
@@ -440,7 +495,12 @@ function playVideosFromLibrary(event, playbackManager) {
         if (hasNextPage && pageEnd > 0 && libraryId &&
             typeof playbackManager.getItemsForPlayback === 'function') {
             const query = isMusicVideosPage
-                ? getMusicVideosPlaybackQuery(libraryId, librarySettings, pageEnd)
+                ? getMusicVideosPlaybackQuery(
+                    libraryId,
+                    librarySettings,
+                    pageEnd - 1,
+                    musicVideosPageSize + 1
+                )
                 : {
                     parentId: libraryId,
                     recursive: true,
@@ -454,13 +514,41 @@ function playVideosFromLibrary(event, playbackManager) {
             nextVideoPromise = Promise.resolve()
                 .then(() => playbackManager.getItemsForPlayback(card.getAttribute('data-serverid'), query))
                 .then(result => {
-                    const nextId = result?.Items?.[0]?.Id;
+                    const resultItems = result?.Items || [];
+                    const anchorId = musicVideoPageItemIds[musicVideoPageItemIds.length - 1];
+                    const anchorIndex = isMusicVideosPage
+                        ? resultItems.findIndex(item => item.Id === anchorId)
+                        : -1;
+                    const nextPageItemIds = isMusicVideosPage
+                        ? getItemIdsAfterAnchor(resultItems, anchorId)
+                        : null;
+                    const nextId = isMusicVideosPage ? nextPageItemIds[0] : resultItems[0]?.Id;
                     if (!nextId) {
-                        console.warn('Input Plugin: The next-page lookup returned no video.');
-                    } else {
-                        console.info('Input Plugin: Next-page lookup found a video.');
                         if (isMusicVideosPage) {
-                            musicVideoNextIndex = pageEnd;
+                            console.error('Input Plugin: Could not find the last visible video in the next-page lookup; refusing to guess the successor.', {
+                                anchorId,
+                                lookupStartIndex: pageEnd - 1,
+                                responseStartIndex: result?.StartIndex ?? null,
+                                firstResultId: resultItems[0]?.Id || null,
+                                firstResultName: resultItems[0]?.Name || null,
+                                resultCount: resultItems.length
+                            });
+                        } else {
+                            console.warn('Input Plugin: The next-page lookup returned no video.');
+                        }
+                    } else {
+                        musicVideoNextIndex = isMusicVideosPage
+                            ? (result?.StartIndex ?? pageEnd - 1) + anchorIndex + 1
+                            : musicVideoNextIndex;
+                        console.info('Input Plugin: Next-page lookup found a video after the visible anchor: ' + JSON.stringify({
+                            anchorId,
+                            anchorIndex,
+                            responseStartIndex: result?.StartIndex ?? null,
+                            nextId,
+                            nextName: resultItems.find(item => item.Id === nextId)?.Name || null
+                        }));
+                        if (isMusicVideosPage) {
+                            musicVideoNextPageIds = nextPageItemIds;
                         }
                     }
                     return nextId;
@@ -486,53 +574,49 @@ function playVideosFromLibrary(event, playbackManager) {
             libraryRoute: window.location.hash,
             itemId,
             itemIndex: musicVideoCurrentIndex,
-            startIndex: Math.floor(musicVideoCurrentIndex / musicVideosPageSize) * musicVideosPageSize,
+            startIndex: pageStartIndex,
             pageChecks: 0,
             pageCheckScheduled: false,
             pageChangeRequested: false
         };
     }
 
-    const playPromise = Promise.resolve().then(() => playbackManager.play({
-        ids: [itemId],
-        serverId,
-        startPositionTicks: Number.isFinite(startPositionTicks) ? startPositionTicks : 0
-    }));
-
-    playPromise.catch(error => {
-        console.error('Input Plugin: Failed to play the selected video:', error);
-    });
-
     Promise.resolve(nextVideoId || nextVideoPromise)
+        .catch(error => {
+            console.error('Input Plugin: Failed to find the next library video:', error);
+            return null;
+        })
         .then(nextId => {
             if (!nextId) {
                 console.warn('Input Plugin: No next video was found in the library.');
-                return;
+                pendingMusicVideoPageAdvance = null;
+            } else if (isMusicVideosPage && libraryId && Number.isInteger(musicVideoNextIndex)) {
+                pendingMusicVideoPageAdvance = {
+                    itemId: nextId,
+                    libraryId,
+                    itemIndex: musicVideoNextIndex,
+                    pageSize: musicVideosPageSize,
+                    pageStartIndex: musicVideoNextPageIds ? musicVideoNextIndex : pageStartIndex,
+                    pageItemIds: musicVideoNextPageIds || musicVideoPageItemIds,
+                    librarySettings,
+                    serverId,
+                    libraryRoute: window.location.hash
+                };
             }
 
-            return playPromise.then(() => {
-                if (isMusicVideosPage && libraryId && Number.isInteger(musicVideoNextIndex)) {
-                    pendingMusicVideoPageAdvance = {
-                        itemId: nextId,
-                        libraryId,
-                        itemIndex: musicVideoNextIndex,
-                        pageSize: musicVideosPageSize,
-                        librarySettings,
-                        serverId,
-                        libraryRoute: window.location.hash
-                    };
-                }
-
-                return playbackManager.queueNext({
-                    ids: [nextId],
-                    serverId
-                });
-            }).then(() => {
-                console.info('Input Plugin: Queued the next library video.');
+            return playbackManager.play({
+                ids: nextId ? [itemId, nextId] : [itemId],
+                serverId,
+                startIndex: 0,
+                startPositionTicks: Number.isFinite(startPositionTicks) ? startPositionTicks : 0
             });
         })
+        .then(() => {
+            console.info('Input Plugin: Started playback with the next library video in the queue.');
+        })
         .catch(error => {
-            console.error('Input Plugin: Failed to queue the next library video:', error);
+            pendingMusicVideoPageAdvance = null;
+            console.error('Input Plugin: Failed to start the selected video:', error);
         });
 }
 
@@ -594,23 +678,48 @@ class inputPlugin {
                         return;
                     }
 
-                    const playlist = playbackManager._playQueueManager?.getPlaylist();
-                    if (!playlist || !Array.isArray(playlist)) {
-                        return;
-                    }
+                    const player = playbackManager._currentPlayer;
+                    const state = playbackManager.getPlayerState(player);
+                    const playlistPromise = Array.isArray(state?.NowPlayingQueue)
+                        ? Promise.resolve(state.NowPlayingQueue)
+                        : Array.isArray(player?.playlist)
+                            ? Promise.resolve(player.playlist)
+                            : playbackManager.getPlaylist(player);
 
-                    const currentIndex = playbackManager._playQueueManager?.getCurrentPlaylistIndex();
-                    if (currentIndex === undefined || currentIndex === null || currentIndex < 0) {
-                        return;
-                    }
+                    Promise.resolve(playlistPromise)
+                        .then(playlist => {
+                            if (!Array.isArray(playlist)) {
+                                throw new Error('Playback manager returned an invalid playlist.');
+                            }
+                            const currentPlaylistItemId = state?.PlaylistItemId ||
+                                (typeof playbackManager.getCurrentPlaylistItemId === 'function'
+                                    ? playbackManager.getCurrentPlaylistItemId(player)
+                                    : null);
+                            let currentIndex = currentPlaylistItemId == null
+                                ? -1
+                                : playlist.findIndex(item => (
+                                    item.PlaylistItemId === currentPlaylistItemId ||
+                                    item.Id === currentPlaylistItemId
+                                ));
+                            if (currentIndex < 0 && typeof player?.getCurrentPlaylistIndex === 'function') {
+                                currentIndex = player.getCurrentPlaylistIndex();
+                            } else if (currentIndex < 0 &&
+                                typeof playbackManager._playQueueManager?.getCurrentPlaylistIndex === 'function') {
+                                currentIndex = playbackManager._playQueueManager.getCurrentPlaylistIndex();
+                            }
+                            if (!Number.isInteger(currentIndex) || currentIndex < 0) {
+                                return;
+                            }
+                            const canNext = currentIndex < playlist.length - 1;
 
-                    const canNext = currentIndex < playlist.length - 1;
+                            const isMusic = state?.NowPlayingItem?.MediaType === 'Audio';
+                            const canPrevious = isMusic ? true : currentIndex > 0;
 
-                    const state = playbackManager.getPlayerState();
-                    const isMusic = state?.NowPlayingItem?.MediaType === 'Audio';
-                    const canPrevious = isMusic ? true : currentIndex > 0;
-
-                    api.player.notifyQueueChange(canNext, canPrevious);
+                            api.player.notifyQueueChange(canNext, canPrevious);
+                        })
+                        .catch(error => {
+                            console.error('PlayerMedia: Error in updateQueueState:', error);
+                        });
                 } catch (e) {
                     console.error('PlayerMedia: Error in updateQueueState:', e);
                 }
@@ -743,6 +852,9 @@ class inputPlugin {
                         window.Events.off(this.attachedPlayer, 'volumechange');
                         window.Events.off(this.attachedPlayer, 'ratechange');
                         window.Events.off(this.attachedPlayer, 'timeupdate');
+                        window.Events.off(this.attachedPlayer, 'playlistitemadd');
+                        window.Events.off(this.attachedPlayer, 'playlistitemremove');
+                        window.Events.off(this.attachedPlayer, 'statechange');
                     }
 
                     this.attachedPlayer = player;
@@ -794,6 +906,10 @@ class inputPlugin {
                         }
                     }, 500);
                 });
+
+                window.Events.on(player, 'playlistitemadd', updateQueueState);
+                window.Events.on(player, 'playlistitemremove', updateQueueState);
+                window.Events.on(player, 'statechange', updateQueueState);
 
                 window.Events.on(player, 'pause', () => {
                     window.NativeShell.setPlaybackActive(false);
@@ -886,6 +1002,9 @@ class inputPlugin {
             window.Events.off(this.attachedPlayer, 'playbackstop');
             window.Events.off(this.attachedPlayer, 'volumechange');
             window.Events.off(this.attachedPlayer, 'timeupdate');
+            window.Events.off(this.attachedPlayer, 'playlistitemadd');
+            window.Events.off(this.attachedPlayer, 'playlistitemremove');
+            window.Events.off(this.attachedPlayer, 'statechange');
             this.attachedPlayer = null;
         }
 
