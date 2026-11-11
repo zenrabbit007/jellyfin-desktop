@@ -69,9 +69,11 @@ function getItemIdsAfterAnchor(items, anchorId) {
     return items.slice(anchorIndex + 1).map(item => item.Id).filter(Boolean);
 }
 
-function getVisibleMusicVideosPageRange(itemsContainer) {
+function getVisiblePageRange() {
     const pageLabel = document.querySelector('.MuiToolbar-root.padded-left .MuiChip-label')
-        ?.textContent?.trim();
+        ?.textContent?.trim() ||
+        document.querySelector('.paging .pagingText')?.textContent?.trim() ||
+        document.querySelector('.paging')?.textContent?.trim();
     const values = pageLabel?.match(/[\d][\d,.\u00a0\u202f]*/g)
         ?.map(value => Number(value.replace(/[^\d]/g, '')));
 
@@ -102,9 +104,708 @@ function getVisibleMusicVideosPageRange(itemsContainer) {
     return null;
 }
 
+const PAGE_PICKER_TRIGGER_ATTR = 'data-jmp-page-picker-trigger';
+const PAGE_PICKER_OVERLAY_CLASS = 'jmp-page-picker';
+const PAGE_PICKER_STYLE_ID = 'jmp-page-picker-style';
+const DEFAULT_LIBRARY_PAGE_SIZE = 100;
+
+let pagePickerOverlay = null;
+let pagePickerState = null;
+let pagePickerTriggerObserver = null;
+let pagePickerTriggerFrame = null;
+
+function getCurrentLibraryId() {
+    const query = window.location.hash.split('?')[1] || window.location.search.slice(1);
+    const routeParams = new URLSearchParams(query);
+    return routeParams.get('topParentId') || routeParams.get('parentId');
+}
+
+function getLibraryPageSize(visibleRange) {
+    const userId = window.ApiClient?.getCurrentUserId?.();
+    const keys = userId ? [`${userId}-libraryPageSize`] : [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+        const key = window.localStorage.key(i);
+        if (key?.endsWith('-libraryPageSize')) {
+            keys.push(key);
+        }
+    }
+
+    for (const key of keys) {
+        const pageSize = parseInt(window.localStorage.getItem(key), 10);
+        if (Number.isInteger(pageSize) && pageSize > 0) {
+            return pageSize;
+        }
+    }
+
+    if (visibleRange.endIndex < visibleRange.total) {
+        return visibleRange.endIndex - visibleRange.startIndex;
+    }
+
+    return DEFAULT_LIBRARY_PAGE_SIZE;
+}
+
+function getPagePickerState(trigger) {
+    if (!document.querySelector('.libraryPage')) {
+        return null;
+    }
+
+    const visibleRange = getVisiblePageRange();
+    if (!visibleRange) {
+        return null;
+    }
+
+    const pageSize = getLibraryPageSize(visibleRange);
+    const totalPages = Math.ceil(visibleRange.total / pageSize);
+    if (totalPages < 2) {
+        return null;
+    }
+
+    return {
+        trigger,
+        libraryId: getCurrentLibraryId(),
+        pageSize,
+        total: visibleRange.total,
+        totalPages,
+        currentPage: Math.floor(visibleRange.startIndex / pageSize) + 1
+    };
+}
+
+function getPageRangeLabel(pageNumber, state) {
+    const firstItem = (pageNumber - 1) * state.pageSize + 1;
+    const lastItem = Math.min(pageNumber * state.pageSize, state.total);
+    return `${firstItem}\u2013${lastItem}`;
+}
+
+function injectPagePickerStyle() {
+    if (document.getElementById(PAGE_PICKER_STYLE_ID)) {
+        return;
+    }
+
+    const style = document.createElement('style');
+    style.id = PAGE_PICKER_STYLE_ID;
+    style.textContent = `
+        .MuiChip-root[${PAGE_PICKER_TRIGGER_ATTR}] {
+            height: 2rem;
+            padding: 0 12px 0 15px;
+            border: 0;
+            border-radius: 8px;
+            background-color: rgba(255, 255, 255, 0.1);
+            color: rgba(255, 255, 255, 0.95);
+            font-size: 0.9rem;
+            font-variant-numeric: tabular-nums;
+            cursor: pointer;
+            transition: background-color 120ms ease-out;
+        }
+
+        .MuiChip-root[${PAGE_PICKER_TRIGGER_ATTR}] > .MuiChip-label {
+            padding: 0;
+            font-size: inherit;
+            line-height: 1;
+        }
+
+        .MuiChip-root[${PAGE_PICKER_TRIGGER_ATTR}]::after {
+            content: '';
+            flex: none;
+            width: 0.5em;
+            height: 0.5em;
+            margin-left: 10px;
+            border-right: 2px solid currentColor;
+            border-bottom: 2px solid currentColor;
+            transform: translateY(-0.16em) rotate(45deg);
+            opacity: 0.85;
+        }
+
+        .MuiChip-root[${PAGE_PICKER_TRIGGER_ATTR}]:hover {
+            background-color: rgba(255, 255, 255, 0.16);
+        }
+
+        .MuiChip-root[${PAGE_PICKER_TRIGGER_ATTR}]:active {
+            background-color: rgba(255, 255, 255, 0.22);
+        }
+
+        .MuiChip-root[${PAGE_PICKER_TRIGGER_ATTR}]:focus-visible {
+            outline: 2px solid #00a4dc;
+            outline-offset: 2px;
+        }
+
+        .${PAGE_PICKER_OVERLAY_CLASS} {
+            position: fixed;
+            inset: 0;
+            z-index: 20000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.72);
+        }
+
+        .jmp-page-picker-panel {
+            display: flex;
+            flex-direction: column;
+            width: min(720px, 90vw);
+            max-height: 80vh;
+            border-radius: 12px;
+            background: #1f1f1f;
+            color: #fff;
+            box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+            overflow: hidden;
+        }
+
+        .jmp-page-picker-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px 8px;
+            font-size: 1.2rem;
+        }
+
+        .jmp-page-picker-close {
+            padding: 0 6px;
+            border: 0;
+            border-radius: 4px;
+            background: transparent;
+            color: inherit;
+            font-size: 28px;
+            line-height: 1;
+            cursor: pointer;
+        }
+
+        .jmp-page-picker-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+            gap: 8px;
+            padding: 8px 20px 20px;
+            overflow-y: auto;
+        }
+
+        .jmp-page-picker-page {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 2px;
+            padding: 8px 10px;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.04);
+            color: inherit;
+            font: inherit;
+            font-size: 1rem;
+            text-align: left;
+            cursor: pointer;
+        }
+
+        .jmp-page-picker-page:hover {
+            background: rgba(255, 255, 255, 0.12);
+        }
+
+        .jmp-page-picker-page[aria-current='page'] {
+            border-color: #00a4dc;
+            background: rgba(0, 164, 220, 0.18);
+        }
+
+        .jmp-page-picker-page small {
+            font-size: 0.75rem;
+            opacity: 0.65;
+        }
+
+        .jmp-page-picker-close:focus-visible,
+        .jmp-page-picker-page:focus-visible {
+            outline: 2px solid #00a4dc;
+            outline-offset: 2px;
+        }
+    `;
+    const head = document.head || document.documentElement;
+    head.appendChild(style);
+}
+
+function buildPagePicker(state) {
+    const overlay = document.createElement('div');
+    overlay.className = PAGE_PICKER_OVERLAY_CLASS;
+
+    const panel = document.createElement('div');
+    panel.className = 'jmp-page-picker-panel';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-labelledby', 'jmp-page-picker-title');
+
+    const header = document.createElement('div');
+    header.className = 'jmp-page-picker-header';
+
+    const title = document.createElement('span');
+    title.id = 'jmp-page-picker-title';
+    title.textContent = 'Select page';
+
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.className = 'jmp-page-picker-close';
+    closeButton.setAttribute('aria-label', 'Close');
+    closeButton.textContent = '\u00d7';
+    closeButton.addEventListener('click', closePagePicker);
+
+    header.append(title, closeButton);
+
+    const grid = document.createElement('div');
+    grid.className = 'jmp-page-picker-grid';
+
+    for (let pageNumber = 1; pageNumber <= state.totalPages; pageNumber++) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'jmp-page-picker-page';
+        button.dataset.page = String(pageNumber);
+        button.setAttribute('aria-label',
+            `Page ${pageNumber}, items ${getPageRangeLabel(pageNumber, state)}`);
+        if (pageNumber === state.currentPage) {
+            button.setAttribute('aria-current', 'page');
+        }
+
+        const number = document.createElement('span');
+        number.textContent = String(pageNumber);
+        const range = document.createElement('small');
+        range.textContent = getPageRangeLabel(pageNumber, state);
+        button.append(number, range);
+        button.addEventListener('click', () => selectPage(pageNumber));
+        grid.appendChild(button);
+    }
+
+    panel.append(header, grid);
+    overlay.appendChild(panel);
+    overlay.addEventListener('click', event => {
+        if (event.target === overlay) {
+            closePagePicker();
+        }
+    });
+
+    return { overlay, grid };
+}
+
+function openPagePicker(trigger) {
+    removePagePicker();
+
+    const state = getPagePickerState(trigger);
+    if (!state) {
+        return;
+    }
+
+    const { overlay, grid } = buildPagePicker(state);
+    document.body.appendChild(overlay);
+    pagePickerOverlay = overlay;
+    pagePickerState = state;
+
+    const currentPage = grid.querySelector('[aria-current="page"]') || grid.firstElementChild;
+    currentPage?.focus();
+    currentPage?.scrollIntoView?.({ block: 'nearest' });
+}
+
+function removePagePicker() {
+    pagePickerOverlay?.remove();
+    pagePickerOverlay = null;
+    pagePickerState = null;
+}
+
+function closePagePicker() {
+    const trigger = pagePickerState?.trigger;
+    removePagePicker();
+    if (trigger?.isConnected) {
+        trigger.focus();
+    }
+}
+
+function getPagePickerColumnCount(grid) {
+    const columns = window.getComputedStyle(grid).gridTemplateColumns;
+    return columns ? columns.split(' ').filter(Boolean).length : 1;
+}
+
+function handlePagePickerKeyDown(event) {
+    if (!pagePickerOverlay) {
+        return;
+    }
+
+    if (event.key === 'Escape' || event.key === 'Esc') {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        closePagePicker();
+        return;
+    }
+
+    if (event.key === 'Tab') {
+        const buttons = Array.from(pagePickerOverlay.querySelectorAll('button'));
+        if (!buttons.length) {
+            return;
+        }
+
+        const currentIndex = buttons.indexOf(document.activeElement);
+        const nextIndex = event.shiftKey
+            ? (currentIndex <= 0 ? buttons.length - 1 : currentIndex - 1)
+            : (currentIndex < 0 || currentIndex === buttons.length - 1 ? 0 : currentIndex + 1);
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        buttons[nextIndex].focus();
+        return;
+    }
+
+    const grid = pagePickerOverlay.querySelector('.jmp-page-picker-grid');
+    const pageButtons = Array.from(grid?.querySelectorAll('.jmp-page-picker-page') || []);
+    const currentIndex = pageButtons.indexOf(document.activeElement);
+    if (currentIndex < 0) {
+        return;
+    }
+
+    const columns = getPagePickerColumnCount(grid);
+    let nextIndex;
+    if (event.key === 'ArrowLeft') {
+        nextIndex = currentIndex - 1;
+    } else if (event.key === 'ArrowRight') {
+        nextIndex = currentIndex + 1;
+    } else if (event.key === 'ArrowUp') {
+        nextIndex = currentIndex - columns;
+    } else if (event.key === 'ArrowDown') {
+        nextIndex = currentIndex + columns;
+    } else if (event.key === 'Home') {
+        nextIndex = 0;
+    } else if (event.key === 'End') {
+        nextIndex = pageButtons.length - 1;
+    } else {
+        return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    const nextButton = pageButtons[Math.max(0, Math.min(pageButtons.length - 1, nextIndex))];
+    nextButton.focus();
+    nextButton.scrollIntoView?.({ block: 'nearest' });
+}
+
+function getLibrarySettingsCandidates(startIndex, libraryId) {
+    const suffix = libraryId ? ` - ${libraryId}` : null;
+    const candidates = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+        const key = window.localStorage.key(i);
+        if (!key || (suffix && !key.endsWith(suffix))) {
+            continue;
+        }
+
+        try {
+            const settings = JSON.parse(window.localStorage.getItem(key));
+            if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+                continue;
+            }
+            if (Number(settings.StartIndex) === startIndex) {
+                candidates.push({ key, settings });
+            }
+        } catch {
+            // Ignore localStorage entries that are not library view settings.
+        }
+    }
+    return candidates;
+}
+
+function setLibraryStartIndex(key, settings, startIndex) {
+    window.localStorage.setItem(key, JSON.stringify({
+        ...settings,
+        StartIndex: startIndex
+    }));
+    window.dispatchEvent(new StorageEvent('local-storage', { key }));
+}
+
+function getVisiblePageLabel() {
+    return document.querySelector('.MuiToolbar-root.padded-left .MuiChip-label')
+        ?.textContent?.trim() || null;
+}
+
+function waitForLibraryPageStart(expectedStartIndex, timeout = 10000) {
+    return new Promise(resolve => {
+        const startedAt = Date.now();
+        const check = () => {
+            const range = getVisiblePageRange();
+            if (range?.startIndex === expectedStartIndex) {
+                resolve(true);
+                return;
+            }
+            if (Date.now() - startedAt >= timeout) {
+                resolve(false);
+                return;
+            }
+            window.setTimeout(check, 100);
+        };
+        check();
+    });
+}
+
+function waitForLibraryPageStateChange(previousLabel, timeout = 500) {
+    return new Promise(resolve => {
+        const startedAt = Date.now();
+        const check = () => {
+            const label = getVisiblePageLabel();
+            if (label !== null && label !== previousLabel) {
+                resolve(true);
+                return;
+            }
+            if (Date.now() - startedAt >= timeout) {
+                resolve(false);
+                return;
+            }
+            window.setTimeout(check, 50);
+        };
+        check();
+    });
+}
+
+async function setLibraryPage(state, targetStartIndex) {
+    const currentRange = getVisiblePageRange();
+    if (!currentRange) {
+        return false;
+    }
+
+    const candidates = getLibrarySettingsCandidates(currentRange.startIndex, state.libraryId);
+    for (const candidate of candidates) {
+        const previousValue = window.localStorage.getItem(candidate.key);
+        setLibraryStartIndex(candidate.key, candidate.settings, targetStartIndex);
+        if (await waitForLibraryPageStateChange(currentRange.label)) {
+            await waitForLibraryPageStart(targetStartIndex);
+            return true;
+        }
+
+        if (previousValue === null) {
+            window.localStorage.removeItem(candidate.key);
+        } else {
+            window.localStorage.setItem(candidate.key, previousValue);
+        }
+        window.dispatchEvent(new StorageEvent('local-storage', { key: candidate.key }));
+    }
+
+    return false;
+}
+
+function clickLibraryPagination(direction) {
+    const groups = Array.from(
+        document.querySelectorAll('.MuiToolbar-root.padded-left .MuiButtonGroup-root')
+    );
+    const group = groups.find(candidate => candidate.querySelector('svg[data-testid="NavigateNextIcon"]')) ||
+        groups[groups.length - 1];
+
+    let button;
+    if (group) {
+        const buttons = Array.from(group.querySelectorAll('button'));
+        button = direction === 'next' ? buttons[buttons.length - 1] : buttons[0];
+    } else {
+        button = document.querySelector(direction === 'next' ? '.paging .btnNextPage' : '.paging .btnPrevPage');
+    }
+
+    if (!button || button.disabled) {
+        return false;
+    }
+    button.click();
+    return true;
+}
+
+function snapshotLibrarySettings() {
+    const snapshot = new Map();
+    for (let i = 0; i < window.localStorage.length; i++) {
+        const key = window.localStorage.key(i);
+        if (!key) {
+            continue;
+        }
+        try {
+            const settings = JSON.parse(window.localStorage.getItem(key));
+            if (settings && typeof settings === 'object' && !Array.isArray(settings)) {
+                snapshot.set(key, Number(settings.StartIndex));
+            }
+        } catch {
+            // Ignore localStorage entries that are not library view settings.
+        }
+    }
+    return snapshot;
+}
+
+function findUpdatedLibrarySettings(snapshot, startIndex) {
+    for (let i = 0; i < window.localStorage.length; i++) {
+        const key = window.localStorage.key(i);
+        if (!key || snapshot.get(key) === startIndex) {
+            continue;
+        }
+        try {
+            const settings = JSON.parse(window.localStorage.getItem(key));
+            if (settings && typeof settings === 'object' && !Array.isArray(settings) &&
+                Number(settings.StartIndex) === startIndex) {
+                return { key, settings };
+            }
+        } catch {
+            // Ignore localStorage entries that are not library view settings.
+        }
+    }
+    return null;
+}
+
+function waitForLibrarySettingsUpdate(snapshot, expectedStartIndex, timeout = 3000) {
+    return new Promise(resolve => {
+        const startedAt = Date.now();
+        const check = () => {
+            const updated = findUpdatedLibrarySettings(snapshot, expectedStartIndex);
+            if (updated) {
+                resolve(updated);
+                return;
+            }
+            if (Date.now() - startedAt >= timeout) {
+                resolve(null);
+                return;
+            }
+            window.setTimeout(check, 100);
+        };
+        check();
+    });
+}
+
+async function stepLibraryPage(state, targetStartIndex) {
+    const range = getVisiblePageRange();
+    if (!range) {
+        return false;
+    }
+
+    const goingForward = range.startIndex < targetStartIndex;
+    const expectedStepStartIndex = goingForward
+        ? range.startIndex + state.pageSize
+        : Math.max(0, range.startIndex - state.pageSize);
+
+    const snapshot = snapshotLibrarySettings();
+    if (!clickLibraryPagination(goingForward ? 'next' : 'previous')) {
+        return false;
+    }
+
+    // Moving one page makes the web client persist the active view's settings key.
+    const updated = await waitForLibrarySettingsUpdate(snapshot, expectedStepStartIndex);
+    if (!updated) {
+        return false;
+    }
+
+    if (expectedStepStartIndex !== targetStartIndex) {
+        setLibraryStartIndex(updated.key, updated.settings, targetStartIndex);
+        await waitForLibraryPageStart(targetStartIndex);
+    }
+
+    return true;
+}
+
+async function goToLibraryPage(state, pageNumber) {
+    const targetStartIndex = Math.min(
+        Math.max(0, (pageNumber - 1) * state.pageSize),
+        Math.max(0, state.total - 1)
+    );
+
+    if (getVisiblePageRange()?.startIndex === targetStartIndex) {
+        window.scrollTo(0, 0);
+        return;
+    }
+
+    window.scrollTo(0, 0);
+
+    if (!(await setLibraryPage(state, targetStartIndex)) &&
+        !(await stepLibraryPage(state, targetStartIndex))) {
+        console.warn('Input Plugin: Could not change the library page.', {
+            targetStartIndex,
+            visibleRange: getVisiblePageRange()?.label || null
+        });
+    }
+}
+
+function selectPage(pageNumber) {
+    const state = pagePickerState;
+    if (!state) {
+        return;
+    }
+
+    closePagePicker();
+    goToLibraryPage(state, pageNumber).catch(error => {
+        console.error('Input Plugin: Failed to change the library page:', error);
+    });
+}
+
+function clearPagePickerTrigger(chip) {
+    if (!chip.hasAttribute(PAGE_PICKER_TRIGGER_ATTR)) {
+        return;
+    }
+    chip.removeAttribute(PAGE_PICKER_TRIGGER_ATTR);
+    chip.removeAttribute('role');
+    chip.removeAttribute('tabindex');
+    chip.removeAttribute('title');
+    chip.removeAttribute('aria-haspopup');
+}
+
+function ensurePagePickerTrigger() {
+    const chip = document.querySelector('.MuiToolbar-root.padded-left .MuiChip-root');
+    if (!chip) {
+        return;
+    }
+
+    if (!document.querySelector('.libraryPage') || !getVisiblePageRange()) {
+        clearPagePickerTrigger(chip);
+        return;
+    }
+
+    if (!chip.hasAttribute(PAGE_PICKER_TRIGGER_ATTR)) {
+        chip.setAttribute(PAGE_PICKER_TRIGGER_ATTR, 'true');
+        chip.setAttribute('role', 'button');
+        chip.setAttribute('tabindex', '0');
+        chip.setAttribute('title', 'Select page');
+        chip.setAttribute('aria-haspopup', 'dialog');
+    }
+}
+
+function schedulePagePickerTriggerUpdate() {
+    if (pagePickerTriggerFrame !== null) {
+        return;
+    }
+    pagePickerTriggerFrame = window.requestAnimationFrame(() => {
+        pagePickerTriggerFrame = null;
+        ensurePagePickerTrigger();
+    });
+}
+
+function handlePagePickerTriggerClick(event) {
+    const trigger = event.target?.closest?.(`[${PAGE_PICKER_TRIGGER_ATTR}]`);
+    if (!trigger) {
+        return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    openPagePicker(trigger);
+}
+
+function handlePagePickerTriggerKeyDown(event) {
+    const trigger = event.target?.closest?.(`[${PAGE_PICKER_TRIGGER_ATTR}]`);
+    if (!trigger || (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar')) {
+        return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    openPagePicker(trigger);
+}
+
+function initPagePicker() {
+    if (!document.body) {
+        window.addEventListener('DOMContentLoaded', initPagePicker, { once: true });
+        return;
+    }
+
+    injectPagePickerStyle();
+    document.addEventListener('click', handlePagePickerTriggerClick, true);
+    document.addEventListener('keydown', handlePagePickerTriggerKeyDown, true);
+    window.addEventListener('keydown', handlePagePickerKeyDown, true);
+    window.addEventListener('hashchange', removePagePicker);
+    document.addEventListener('viewshow', removePagePicker, true);
+
+    pagePickerTriggerObserver = new MutationObserver(schedulePagePickerTriggerUpdate);
+    pagePickerTriggerObserver.observe(document.body, { childList: true, subtree: true });
+    ensurePagePickerTrigger();
+}
+
 function returnToMusicVideosLibrary(event, playbackManager) {
-    const pendingReturn = pendingMusicVideoReturn;
-    if (!pendingReturn?.libraryRoute || window.location.hash.split('?')[0] !== '#/video') {
+    if (!pendingMusicVideoReturn?.libraryRoute || window.location.hash.split('?')[0] !== '#/video') {
         return;
     }
 
@@ -115,22 +816,14 @@ function returnToMusicVideosLibrary(event, playbackManager) {
     }
 
     const playerState = playbackManager.getPlayerState();
-    const currentItemId = playerState?.NowPlayingItem?.Id;
-    if (pendingMusicVideoPageAdvance?.itemId === currentItemId) {
+    if (pendingMusicVideoPageAdvance?.itemId === playerState?.NowPlayingItem?.Id) {
         advanceMusicVideosPageOnPlayback(playbackManager, playerState);
     }
 
-    console.info('Input Plugin: Returning from the active Music Video: ' + JSON.stringify({
-        currentItemId: currentItemId || null,
-        savedItemId: pendingMusicVideoReturn?.itemId || null,
-        currentIndex: pendingMusicVideoReturn?.itemIndex ?? null,
-        targetStartIndex: pendingMusicVideoReturn?.startIndex ?? null
-    }));
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    window.location.hash = pendingMusicVideoReturn?.libraryRoute || pendingReturn.libraryRoute;
-    console.info('Input Plugin: Returning to the Music Videos library from the video control.');
+    window.location.hash = pendingMusicVideoReturn.libraryRoute;
 }
 
 function refreshMusicVideosLibraryOnReturn() {
@@ -149,7 +842,6 @@ function refreshMusicVideosLibraryOnReturn() {
     window.dispatchEvent(new StorageEvent('local-storage', {
         key: `musicvideos - ${pendingReturn.libraryId}`
     }));
-    console.info('Input Plugin: Refreshed Music Videos library settings after returning from video.');
     advanceMusicVideosLibraryPageOnReturn(pendingReturn);
 }
 
@@ -168,7 +860,7 @@ function advanceMusicVideosLibraryPageOnReturn(pendingReturn) {
             return;
         }
 
-        const visibleRange = getVisibleMusicVideosPageRange();
+        const visibleRange = getVisiblePageRange();
         if (visibleRange?.startIndex === pendingReturn.startIndex) {
             const activeCard = Array.from(document.querySelectorAll('.card[data-id], .listItem[data-id]'))
                 .find(card => card.getAttribute('data-id') === pendingReturn.itemId);
@@ -178,14 +870,8 @@ function advanceMusicVideosLibraryPageOnReturn(pendingReturn) {
                 }
                 activeCard.focus();
                 activeCard.scrollIntoView({ block: 'center', inline: 'nearest' });
-            } else {
-                console.warn('Input Plugin: Could not find the active Music Video in the restored library page.', {
-                    itemId: pendingReturn.itemId,
-                    startIndex: pendingReturn.startIndex
-                });
             }
             pendingMusicVideoReturn = null;
-            console.info('Input Plugin: Returned to the active Music Video in the library.');
             return;
         }
 
@@ -198,38 +884,18 @@ function advanceMusicVideosLibraryPageOnReturn(pendingReturn) {
             return;
         }
 
-        if (!visibleRange) {
-            if (pendingReturn.pageChecks === 0) {
-                console.warn('Input Plugin: Waiting for the Music Videos page range to appear after returning.');
-            }
-        } else if (!pendingReturn.pageChangeRequested) {
+        if (visibleRange && !pendingReturn.pageChangeRequested) {
             const isPreviousPage = visibleRange.startIndex > pendingReturn.startIndex;
             const expectedLabel = isPreviousPage ? 'Previous' : 'Next';
-            const buttons = Array.from(document.querySelectorAll('button'));
-            const paginationButton = buttons.find(button => (
-                [button.title, button.getAttribute('aria-label')]
-                    .some(label => label?.trim().toLowerCase() === expectedLabel.toLowerCase())
-            ));
-
-            if (pendingReturn.pageChecks === 0) {
-                console.info('Input Plugin: Checking Music Videos return pagination: ' + JSON.stringify({
-                    expectedStartIndex: pendingReturn.startIndex,
-                    visibleRange: visibleRange.label,
-                    buttonCount: buttons.length,
-                    buttonLabels: buttons
-                        .map(button => button.title || button.getAttribute('aria-label') || '')
-                        .filter(Boolean)
-                        .slice(-12),
-                    paginationLabel: expectedLabel,
-                    paginationButtonFound: !!paginationButton,
-                    paginationButtonDisabled: paginationButton?.disabled ?? null
-                }));
-            }
+            const paginationButton = Array.from(document.querySelectorAll('button'))
+                .find(button => (
+                    [button.title, button.getAttribute('aria-label')]
+                        .some(label => label?.trim().toLowerCase() === expectedLabel.toLowerCase())
+                ));
 
             if (paginationButton && !paginationButton.disabled) {
                 pendingReturn.pageChangeRequested = true;
                 paginationButton.click();
-                console.info('Input Plugin: Requested the Music Videos pagination control to show the queued video page.');
             }
         }
 
@@ -245,11 +911,6 @@ function advanceMusicVideosPageOnPlayback(playbackManager, playerState) {
     }
 
     const nowPlayingItem = (playerState || playbackManager.getPlayerState())?.NowPlayingItem;
-    console.info('Input Plugin: Checking queued Music Video page advance: ' + JSON.stringify({
-        expectedItemId: pendingAdvance.itemId,
-        currentItemId: nowPlayingItem?.Id || null,
-        libraryId: pendingAdvance.libraryId
-    }));
     if (nowPlayingItem?.Id !== pendingAdvance.itemId) {
         return;
     }
@@ -287,7 +948,6 @@ function advanceMusicVideosPageOnPlayback(playbackManager, playerState) {
                 libraryId: pendingAdvance.libraryId,
                 libraryRoute: pendingAdvance.libraryRoute,
                 itemId: pendingAdvance.itemId,
-                itemIndex: pendingAdvance.itemIndex,
                 startIndex: librarySettings.StartIndex,
                 pageChecks: 0,
                 pageCheckScheduled: false,
@@ -296,8 +956,6 @@ function advanceMusicVideosPageOnPlayback(playbackManager, playerState) {
         } catch (error) {
             console.error('Input Plugin: Could not restore the next Music Videos page:', error);
         }
-
-        console.info('Input Plugin: Saved the Music Videos page containing the queued video.');
     }
 
     const nextItemIndex = pendingAdvance.itemIndex + 1;
@@ -381,44 +1039,26 @@ function playVideosFromLibrary(event, playbackManager) {
 
     pendingMusicVideoPageAdvance = null;
 
+    // Let the default single-video playback handle the click when queueing is disabled.
     if (window.jmpInfo?.settings?.main?.playAllVideosFromLibrary === false) {
-        console.warn('Input Plugin: Library queue setting is disabled.');
         return;
     }
-
-    console.warn('Input Plugin: Detected a Play/Resume click: ' + JSON.stringify({
-        action,
-        setting: window.jmpInfo?.settings?.main?.playAllVideosFromLibrary
-    }));
 
     const card = actionElement.closest('[data-id][data-serverid][data-mediatype="Video"]');
     const itemsContainer = card?.closest('.itemsContainer');
 
     if (!card || !itemsContainer) {
-        console.warn('Input Plugin: Could not handle video play click.', {
-            cardFound: !!card,
-            itemsContainerFound: !!itemsContainer
-        });
         return;
     }
 
     const siblingCards = itemsContainer.querySelectorAll('[data-id][data-serverid][data-mediatype="Video"]');
-    const cardIndex = siblingCards ? Array.prototype.indexOf.call(siblingCards, card) : -1;
+    const cardIndex = Array.prototype.indexOf.call(siblingCards, card);
 
     if (cardIndex < 0) {
-        console.warn('Input Plugin: Clicked video was not found in its library item list.', {
-            visibleVideoCount: siblingCards?.length || 0
-        });
         return;
     }
 
-    let nextVideoCard = null;
-    for (let i = cardIndex + 1; i < siblingCards.length; i++) {
-        if (siblingCards[i].getAttribute('data-mediatype') === 'Video') {
-            nextVideoCard = siblingCards[i];
-            break;
-        }
-    }
+    const nextVideoCard = siblingCards[cardIndex + 1];
 
     let nextVideoId = nextVideoCard?.getAttribute('data-id');
     let nextVideoPromise;
@@ -432,9 +1072,9 @@ function playVideosFromLibrary(event, playbackManager) {
     const modernLibraryPage = itemsContainer.closest('.libraryPage');
     const isMusicVideosPage = card.getAttribute('data-context') === 'musicvideos' ||
         modernLibraryPage?.id === 'musicvideos' ||
-        /(?:^|\/)musicvideos(?:[?#]|$)/.test(
+        (/(?:^|\/)musicvideos(?:[?#]|$)/.test(
             `${window.location.pathname}${window.location.hash}`
-        ) && routeParams.get('tab') === '2';
+        ) && routeParams.get('tab') === '2');
     const savedSettings = isMusicVideosPage
         ? window.localStorage.getItem(`musicvideos - ${libraryId}`)
         : null;
@@ -453,7 +1093,7 @@ function playVideosFromLibrary(event, playbackManager) {
     }
 
     const visiblePageRange = isMusicVideosPage
-        ? getVisibleMusicVideosPageRange(itemsContainer)
+        ? getVisiblePageRange()
         : null;
     const pageStartIndex = visiblePageRange?.startIndex ?? (Number(librarySettings.StartIndex) || 0);
     const musicVideosPageSize = siblingCards.length;
@@ -479,19 +1119,6 @@ function playVideosFromLibrary(event, playbackManager) {
                 : pageEnd > 0
             : !!itemsContainer.parentNode?.querySelector('.paging .btnNextPage:not([disabled])');
 
-        console.info('Input Plugin: Looking for the next library video: ' + JSON.stringify({
-            isMusicVideosPage,
-            route: `${window.location.pathname}${window.location.hash}`,
-            libraryFound: !!libraryId,
-            storedPageStart: librarySettings.StartIndex,
-            visiblePageRange: visiblePageRange?.label || null,
-            pageStart: pageStartIndex,
-            visibleVideoCount: siblingCards.length,
-            clickedVideoIndex: cardIndex,
-            nextPageOffset: pageEnd,
-            hasNextPage
-        }));
-
         if (hasNextPage && pageEnd > 0 && libraryId &&
             typeof playbackManager.getItemsForPlayback === 'function') {
             const query = isMusicVideosPage
@@ -515,42 +1142,25 @@ function playVideosFromLibrary(event, playbackManager) {
                 .then(() => playbackManager.getItemsForPlayback(card.getAttribute('data-serverid'), query))
                 .then(result => {
                     const resultItems = result?.Items || [];
-                    const anchorId = musicVideoPageItemIds[musicVideoPageItemIds.length - 1];
-                    const anchorIndex = isMusicVideosPage
-                        ? resultItems.findIndex(item => item.Id === anchorId)
-                        : -1;
-                    const nextPageItemIds = isMusicVideosPage
-                        ? getItemIdsAfterAnchor(resultItems, anchorId)
-                        : null;
-                    const nextId = isMusicVideosPage ? nextPageItemIds[0] : resultItems[0]?.Id;
-                    if (!nextId) {
-                        if (isMusicVideosPage) {
-                            console.error('Input Plugin: Could not find the last visible video in the next-page lookup; refusing to guess the successor.', {
-                                anchorId,
-                                lookupStartIndex: pageEnd - 1,
-                                responseStartIndex: result?.StartIndex ?? null,
-                                firstResultId: resultItems[0]?.Id || null,
-                                firstResultName: resultItems[0]?.Name || null,
-                                resultCount: resultItems.length
-                            });
-                        } else {
-                            console.warn('Input Plugin: The next-page lookup returned no video.');
-                        }
-                    } else {
-                        musicVideoNextIndex = isMusicVideosPage
-                            ? (result?.StartIndex ?? pageEnd - 1) + anchorIndex + 1
-                            : musicVideoNextIndex;
-                        console.info('Input Plugin: Next-page lookup found a video after the visible anchor: ' + JSON.stringify({
-                            anchorId,
-                            anchorIndex,
-                            responseStartIndex: result?.StartIndex ?? null,
-                            nextId,
-                            nextName: resultItems.find(item => item.Id === nextId)?.Name || null
-                        }));
-                        if (isMusicVideosPage) {
-                            musicVideoNextPageIds = nextPageItemIds;
-                        }
+                    if (!isMusicVideosPage) {
+                        return resultItems[0]?.Id;
                     }
+
+                    const anchorId = musicVideoPageItemIds[musicVideoPageItemIds.length - 1];
+                    const anchorIndex = resultItems.findIndex(item => item.Id === anchorId);
+                    const nextPageItemIds = getItemIdsAfterAnchor(resultItems, anchorId);
+                    const nextId = nextPageItemIds[0];
+                    if (!nextId) {
+                        console.error('Input Plugin: Could not find the last visible video in the next-page lookup; refusing to guess the successor.', {
+                            anchorId,
+                            lookupStartIndex: pageEnd - 1,
+                            responseStartIndex: result?.StartIndex ?? null
+                        });
+                        return undefined;
+                    }
+
+                    musicVideoNextIndex = (result?.StartIndex ?? pageEnd - 1) + anchorIndex + 1;
+                    musicVideoNextPageIds = nextPageItemIds;
                     return nextId;
                 });
         }
@@ -573,7 +1183,6 @@ function playVideosFromLibrary(event, playbackManager) {
             libraryId,
             libraryRoute: window.location.hash,
             itemId,
-            itemIndex: musicVideoCurrentIndex,
             startIndex: pageStartIndex,
             pageChecks: 0,
             pageCheckScheduled: false,
@@ -588,7 +1197,6 @@ function playVideosFromLibrary(event, playbackManager) {
         })
         .then(nextId => {
             if (!nextId) {
-                console.warn('Input Plugin: No next video was found in the library.');
                 pendingMusicVideoPageAdvance = null;
             } else if (isMusicVideosPage && libraryId && Number.isInteger(musicVideoNextIndex)) {
                 pendingMusicVideoPageAdvance = {
@@ -611,9 +1219,6 @@ function playVideosFromLibrary(event, playbackManager) {
                 startPositionTicks: Number.isFinite(startPositionTicks) ? startPositionTicks : 0
             });
         })
-        .then(() => {
-            console.info('Input Plugin: Started playback with the next library video in the queue.');
-        })
         .catch(error => {
             pendingMusicVideoPageAdvance = null;
             console.error('Input Plugin: Failed to start the selected video:', error);
@@ -629,6 +1234,9 @@ class inputPlugin {
         this.durationCheckInterval = null;
         this.positionUpdateInterval = null;
         this.attachedPlayer = null;
+
+        initPagePicker();
+
         this.videoBackHandler = event => returnToMusicVideosLibrary(event, playbackManager);
         this.musicVideoReturnHandler = () => {
             window.setTimeout(refreshMusicVideosLibraryOnReturn, 100);
@@ -636,7 +1244,6 @@ class inputPlugin {
         window.addEventListener('hashchange', this.musicVideoReturnHandler);
         document.addEventListener('viewshow', this.musicVideoReturnHandler, true);
         document.addEventListener('click', this.videoBackHandler, true);
-        console.warn('Input Plugin: Click handler initialized.');
         this.videoPlayClickHandler = event => playVideosFromLibrary(event, playbackManager);
         document.addEventListener('click', this.videoPlayClickHandler, true);
 
