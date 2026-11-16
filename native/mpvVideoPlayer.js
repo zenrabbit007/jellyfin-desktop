@@ -1,5 +1,204 @@
 /* eslint-disable indent */
 (function() {
+    const HOLD_SPEED_RATE = 2;
+    // Must be below the OSD's 300ms pointerdown-to-play/pause delay so the
+    // speed-up starts (and the pause is suppressed) before that timer fires.
+    const HOLD_SPEED_DELAY_MS = 250;
+    // The OSD pauses 300ms after pointerdown even when the button was already
+    // released, so ignore pauses for a moment past that point.
+    const HOLD_SPEED_PAUSE_GUARD_MS = 400;
+
+    // Elements which should keep their normal mouse behavior instead of
+    // triggering the temporary playback speed-up.
+    const HOLD_SPEED_IGNORE_SELECTOR = [
+        'button',
+        'input',
+        'textarea',
+        'select',
+        'a',
+        '[role="button"]',
+        '[role="slider"]',
+        '.videoOsdBottom',
+        '.upNextContainer',
+        '.skinHeader',
+        '.dialogContainer',
+        '.actionSheet',
+        '.toast'
+    ].join(',');
+
+    // The hold gesture is tracked here instead of on the player instance: the
+    // web client destroys and re-creates the player between videos, which used
+    // to drop the listeners (and the gesture with them) after the first video.
+    const holdSpeed = {
+        /**
+         * @type {any}
+         */
+        player: undefined,
+        /**
+         * @type {boolean}
+         */
+        isPlaying: false,
+        /**
+         * @type {boolean}
+         */
+        pending: false,
+        /**
+         * @type {boolean}
+         */
+        active: false,
+        /**
+         * @type {number | null}
+         */
+        pointerId: null,
+        /**
+         * @type {number | null}
+         */
+        timer: null,
+        /**
+         * @type {number | undefined}
+         */
+        restoreRate: undefined,
+        /**
+         * @type {number}
+         */
+        pauseGuardUntil: 0
+    };
+
+    /**
+     * @param {any} target
+     * @returns {boolean}
+     */
+    function isHoldSpeedSurface(target) {
+        if (!(target instanceof Element)) {
+            return false;
+        }
+
+        return !target.closest(HOLD_SPEED_IGNORE_SELECTOR);
+    }
+
+    /**
+     * @returns {number}
+     */
+    function getHoldSpeedRestoreRate() {
+        try {
+            const rate = holdSpeed.player?.getPlaybackRate();
+            if (rate && isFinite(rate) && rate > 0) {
+                return rate;
+            }
+        } catch (e) {
+            console.error('[MPV] hold speed: could not read playback rate', e);
+        }
+
+        return 1;
+    }
+
+    function stopHoldSpeed() {
+        clearTimeout(holdSpeed.timer);
+        holdSpeed.timer = null;
+
+        const wasActive = holdSpeed.active;
+        const restoreRate = holdSpeed.restoreRate;
+
+        holdSpeed.pending = false;
+        holdSpeed.active = false;
+        holdSpeed.pointerId = null;
+        holdSpeed.restoreRate = undefined;
+
+        if (!wasActive) {
+            return;
+        }
+
+        const rate = restoreRate || 1;
+        window.api.player.setPlaybackRate(rate * 1000);
+
+        // The temporary speed also lands in the player's stored rate (the
+        // native player reports every rate change back to the web client), so
+        // put it back or the next video would start sped up.
+        if (holdSpeed.player) {
+            holdSpeed.player._playRate = rate;
+        }
+
+        console.log('[MPV] hold speed: restored to', rate);
+    }
+
+    /**
+     * @param {PointerEvent} e
+     */
+    function onHoldSpeedPointerDown(e) {
+        if (e.button !== 0 || (e.pointerType && e.pointerType !== 'mouse')) {
+            return;
+        }
+
+        if (!holdSpeed.isPlaying || !holdSpeed.player || holdSpeed.pending || holdSpeed.active) {
+            return;
+        }
+
+        if (!isHoldSpeedSurface(e.target)) {
+            return;
+        }
+
+        holdSpeed.pending = true;
+        holdSpeed.pointerId = e.pointerId;
+        holdSpeed.restoreRate = getHoldSpeedRestoreRate();
+        const pointerDownTime = performance.now();
+
+        clearTimeout(holdSpeed.timer);
+        holdSpeed.timer = setTimeout(() => {
+            holdSpeed.timer = null;
+
+            if (!holdSpeed.pending) {
+                return;
+            }
+
+            // Bypass setPlaybackRate() so the temporary speed isn't stored as
+            // the player's playback rate.
+            holdSpeed.active = true;
+            // The OSD toggles play/pause 300ms after the pointerdown that
+            // started this gesture, so keep that toggle suppressed.
+            holdSpeed.pauseGuardUntil = pointerDownTime + HOLD_SPEED_PAUSE_GUARD_MS;
+            window.api.player.setPlaybackRate(HOLD_SPEED_RATE * 1000);
+            console.log('[MPV] hold speed:', HOLD_SPEED_RATE);
+        }, HOLD_SPEED_DELAY_MS);
+    }
+
+    /**
+     * @param {PointerEvent} e
+     */
+    function onHoldSpeedPointerUp(e) {
+        if (holdSpeed.pointerId !== null && e.pointerId !== undefined && e.pointerId !== holdSpeed.pointerId) {
+            return;
+        }
+
+        stopHoldSpeed();
+    }
+
+    /**
+     * Safety net for a pointerup that never arrives (e.g. the button was
+     * released outside the window), which would otherwise leave playback stuck
+     * at the temporary speed.
+     * @param {PointerEvent} e
+     */
+    function onHoldSpeedPointerMove(e) {
+        if (e.pointerType && e.pointerType !== 'mouse') {
+            return;
+        }
+
+        if (e.buttons === 0) {
+            stopHoldSpeed();
+        }
+    }
+
+    document.addEventListener('pointerdown', onHoldSpeedPointerDown, true);
+    document.addEventListener('pointerup', onHoldSpeedPointerUp, true);
+    document.addEventListener('pointermove', onHoldSpeedPointerMove, true);
+    document.addEventListener('pointercancel', stopHoldSpeed, true);
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            stopHoldSpeed();
+        }
+    });
+    window.addEventListener('blur', stopHoldSpeed);
+
     function getMediaStreamAudioTracks(mediaSource) {
         return mediaSource.MediaStreams.filter(function (s) {
             return s.Type === 'Audio';
@@ -153,7 +352,11 @@
              * @private
              */
             this.onPlaying = () => {
+                holdSpeed.isPlaying = true;
+
                 if (!this._started) {
+                    // Don't carry a held speed-over into the freshly started video.
+                    stopHoldSpeed();
                     this._started = true;
 
                     this.loading.hide();
@@ -195,6 +398,8 @@
              */
             this.onPause = () => {
                 this._paused = true;
+                holdSpeed.isPlaying = false;
+                stopHoldSpeed();
                 // For Syncplay ready notification
                 this.events.trigger(this, 'pause');
             };
@@ -246,6 +451,10 @@
         }
 
         async play(options) {
+            stopHoldSpeed();
+            holdSpeed.player = this;
+            holdSpeed.isPlaying = false;
+
             this._started = false;
             this._timeUpdated = false;
             this._currentTime = null;
@@ -454,6 +663,9 @@
         }
 
         onEndedInternal() {
+            holdSpeed.isPlaying = false;
+            stopHoldSpeed();
+
             const stopInfo = {
                 src: this._currentSrc
             };
@@ -477,6 +689,10 @@
         }
 
         removeMediaDialog() {
+            holdSpeed.isPlaying = false;
+            stopHoldSpeed();
+            this._started = false;
+
             window.api.player.stop();
 
             window.api.player.setVideoRectangle(-1, 0, 0, 0);
@@ -498,6 +714,10 @@
 
         destroy() {
             this.removeMediaDialog();
+
+            if (holdSpeed.player === this) {
+                holdSpeed.player = undefined;
+            }
 
             const player = window.api.player;
             this._hasConnection = false;
@@ -701,6 +921,12 @@
     }
 
     pause() {
+        // The OSD pauses playback 300ms after pointerdown. Ignore that while
+        // the user is holding the video to temporarily speed it up.
+        if (holdSpeed.pending || holdSpeed.active || performance.now() < holdSpeed.pauseGuardUntil) {
+            return;
+        }
+
         window.api.player.pause();
     }
 
