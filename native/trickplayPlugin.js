@@ -35,23 +35,14 @@ function isPreviewEnabled() {
     return window.jmpInfo?.settings?.video?.trickplay_preview !== false;
 }
 
-function serverTrickplayShown(bubble) {
-    // The client's own handler sizes this wrapper from the trickplay info the
-    // server sent. An item whose Trickplay map is empty ({}, which is truthy)
-    // makes it claim the bubble while leaving the wrapper without any size,
-    // i.e. nothing is actually shown.
-    const wrapper = bubble.querySelector('.chapterThumbWrapper, .chapterThumb');
-    if (!wrapper) {
-        return false;
+function backgroundUrl(element) {
+    const value = element.style.backgroundImage || window.getComputedStyle(element).backgroundImage;
+    if (!value || value === 'none') {
+        return null;
     }
 
-    if (parseFloat(wrapper.style.width) > 0 && parseFloat(wrapper.style.height) > 0) {
-        return true;
-    }
-
-    // Other client versions size the wrapper through CSS instead.
-    const background = window.getComputedStyle(wrapper).backgroundImage;
-    return !!background && background !== 'none' && wrapper.offsetWidth > 0 && wrapper.offsetHeight > 0;
+    const match = /url\((['"]?)(.*?)\1\)/.exec(value);
+    return match && match[2] ? match[2] : null;
 }
 
 function splitKey(key) {
@@ -104,7 +95,9 @@ class trickplayPlugin {
         this.inFlight = null;
         this.prefetchTimer = undefined;
         this.warnedNoInfo = false;
-        this.warnedClientPreview = false;
+        this.goodTiles = new Set();
+        this.badTiles = new Set();
+        this.probingTiles = new Set();
         this.lastFrame = null;
         this.direction = 1;
         this.patchScheduled = false;
@@ -169,19 +162,16 @@ class trickplayPlugin {
 
     patchSlider() {
         const slider = document.querySelector('#videoOsdPage .osdPositionSlider');
-        if (!slider) {
+        if (!slider || slider === this.slider) {
             return;
         }
 
         this.slider = slider;
 
-        // Re-hook whenever our wrapper is not the handler any more. The client
-        // rebuilds the OSD between playbacks and can replace the property
-        // outright (which drops an earlier hook), so trusting "already patched"
-        // flags left some videos without previews.
-        if (slider.updateBubbleHtml?.jmpTrickplayWrapper === true) {
+        if (slider.dataset.jmpTrickplayPatched === '1') {
             return;
         }
+        slider.dataset.jmpTrickplayPatched = '1';
 
         let originalUpdateBubbleHtml = slider.updateBubbleHtml;
         const plugin = this;
@@ -191,40 +181,89 @@ class trickplayPlugin {
                 ? originalUpdateBubbleHtml.call(this, bubble, value)
                 : false;
 
-            if (handled && serverTrickplayShown(bubble)) {
-                // The server has real trickplay images for this item.
-                if (!plugin.warnedClientPreview) {
-                    plugin.warnedClientPreview = true;
-                    console.info('Trickplay Preview: the client drew its own preview');
-                }
-                plugin.hover = null;
+            if (handled && plugin.serverTrickplayUsable(bubble)) {
+                // The server has real trickplay images for this item: drop our
+                // state (and styling) so the client's bubble is left alone.
+                plugin.stopPreviewing(bubble);
                 return true;
             }
 
             return plugin.onSliderBubbleUpdate(this, bubble, value);
         };
 
-        wrapped.jmpTrickplayWrapper = true;
-
         // The video player assigns updateBubbleHtml whenever the OSD view is
         // initialized, and it is called both while hovering and while dragging
-        // the slider. An accessor keeps the wrapper in place across those
-        // assignments.
-        try {
-            Object.defineProperty(slider, 'updateBubbleHtml', {
-                configurable: true,
-                enumerable: true,
-                get() {
-                    return wrapped;
-                },
-                set(fn) {
-                    originalUpdateBubbleHtml = fn;
-                }
-            });
-            console.info('Trickplay Preview: hooked the seek bar');
-        } catch (error) {
-            console.error('Trickplay Preview: could not hook the seek bar', error);
+        // the slider. Use an accessor so the wrapper survives re-assignment.
+        Object.defineProperty(slider, 'updateBubbleHtml', {
+            configurable: true,
+            enumerable: true,
+            get() {
+                return wrapped;
+            },
+            set(fn) {
+                originalUpdateBubbleHtml = fn;
+            }
+        });
+    }
+
+    serverTrickplayUsable(bubble) {
+        // The client puts the sprite image on .chapterThumb, inside
+        // .chapterThumbWrapper, and different versions size one or the other.
+        const candidates = bubble.querySelectorAll('.chapterThumbWrapper, .chapterThumb');
+        let pendingUrl = null;
+
+        for (const element of candidates) {
+            const url = backgroundUrl(element);
+            if (!url) {
+                continue;
+            }
+
+            if (url.indexOf('NaN') !== -1 || url.indexOf('undefined') !== -1) {
+                // Items without server trickplay data still get a bubble like
+                // this, built from missing information.
+                return false;
+            }
+
+            if (this.goodTiles.has(url)) {
+                return true;
+            }
+
+            if (this.badTiles.has(url)) {
+                continue;
+            }
+
+            if (!pendingUrl) {
+                pendingUrl = url;
+            }
         }
+
+        if (pendingUrl) {
+            // Until the server proves it can serve this image, show our own
+            // frame instead of an empty box.
+            this.probeServerTile(pendingUrl);
+        }
+
+        return false;
+    }
+
+    probeServerTile(url) {
+        if (this.probingTiles.has(url)) {
+            return;
+        }
+
+        this.probingTiles.add(url);
+
+        const image = new Image();
+        image.onload = () => {
+            this.probingTiles.delete(url);
+            this.goodTiles.add(url);
+        };
+        image.onerror = () => {
+            this.probingTiles.delete(url);
+            this.badTiles.add(url);
+            console.info('Trickplay Preview: server trickplay image unavailable, generating frames instead');
+        };
+        image.src = url;
     }
 
     getPlaybackInfo() {
@@ -297,7 +336,6 @@ class trickplayPlugin {
         }
 
         this.warnedNoInfo = false;
-        this.warnedClientPreview = false;
 
         const positionMs = info.durationMs * value / 100;
         if (!Number.isFinite(positionMs) || positionMs < 0) {
