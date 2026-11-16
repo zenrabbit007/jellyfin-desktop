@@ -107,12 +107,16 @@ function getVisiblePageRange() {
 const PAGE_PICKER_TRIGGER_ATTR = 'data-jmp-page-picker-trigger';
 const PAGE_PICKER_OVERLAY_CLASS = 'jmp-page-picker';
 const PAGE_PICKER_STYLE_ID = 'jmp-page-picker-style';
+const PAGE_NAV_CLASS = 'jmp-page-nav';
+const PAGE_NAV_BODY_CLASS = 'jmp-has-page-nav';
+const PAGINATION_HIDDEN_ATTR = 'data-jmp-pagination-hidden';
 const DEFAULT_LIBRARY_PAGE_SIZE = 100;
 
 let pagePickerOverlay = null;
 let pagePickerState = null;
 let pagePickerTriggerObserver = null;
 let pagePickerTriggerFrame = null;
+let pageNav = null;
 
 function getCurrentLibraryId() {
     const query = window.location.hash.split('?')[1] || window.location.search.slice(1);
@@ -166,7 +170,8 @@ function getPagePickerState(trigger) {
         pageSize,
         total: visibleRange.total,
         totalPages,
-        currentPage: Math.floor(visibleRange.startIndex / pageSize) + 1
+        currentPage: Math.floor(visibleRange.startIndex / pageSize) + 1,
+        label: visibleRange.label
     };
 }
 
@@ -224,6 +229,114 @@ function injectPagePickerStyle() {
         }
 
         .MuiChip-root[${PAGE_PICKER_TRIGGER_ATTR}]:focus-visible {
+            outline: 2px solid #00a4dc;
+            outline-offset: 2px;
+        }
+
+        body.${PAGE_NAV_BODY_CLASS} .MuiChip-root[${PAGE_PICKER_TRIGGER_ATTR}],
+        [${PAGINATION_HIDDEN_ATTR}] {
+            display: none !important;
+        }
+
+        .${PAGE_NAV_CLASS} {
+            position: fixed;
+            top: 12px;
+            left: 50%;
+            z-index: 9000;
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            padding: 4px 5px;
+            border-radius: 999px;
+            background: rgba(26, 26, 26, 0.94);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(12px);
+            transform: translateX(-50%);
+        }
+
+        .jmp-page-nav-arrow {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 2rem;
+            height: 2rem;
+            padding: 0;
+            border: 0;
+            border-radius: 50%;
+            background: transparent;
+            color: rgba(255, 255, 255, 0.92);
+            cursor: pointer;
+            transition: background-color 120ms ease-out, opacity 120ms ease-out;
+        }
+
+        .jmp-page-nav-arrow::before {
+            content: '';
+            width: 0.5rem;
+            height: 0.5rem;
+            border-right: 2px solid currentColor;
+            border-bottom: 2px solid currentColor;
+        }
+
+        .jmp-page-nav-arrow[data-direction='previous']::before {
+            transform: translateX(0.08rem) rotate(135deg);
+        }
+
+        .jmp-page-nav-arrow[data-direction='next']::before {
+            transform: translateX(-0.08rem) rotate(-45deg);
+        }
+
+        .jmp-page-nav-arrow:enabled:hover {
+            background: rgba(255, 255, 255, 0.14);
+        }
+
+        .jmp-page-nav-arrow:enabled:active {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .jmp-page-nav-arrow:disabled {
+            opacity: 0.32;
+            cursor: default;
+        }
+
+        .jmp-page-nav-trigger {
+            display: flex;
+            align-items: center;
+            height: 2rem;
+            padding: 0 12px;
+            border: 0;
+            border-radius: 999px;
+            background: transparent;
+            color: rgba(255, 255, 255, 0.95);
+            font: inherit;
+            font-size: 0.9rem;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: background-color 120ms ease-out;
+        }
+
+        .jmp-page-nav-trigger::after {
+            content: '';
+            flex: none;
+            width: 0.45em;
+            height: 0.45em;
+            margin-left: 10px;
+            border-right: 2px solid currentColor;
+            border-bottom: 2px solid currentColor;
+            opacity: 0.85;
+            transform: translateY(-0.18em) rotate(45deg);
+        }
+
+        .jmp-page-nav-trigger:hover {
+            background: rgba(255, 255, 255, 0.12);
+        }
+
+        .jmp-page-nav-trigger:active {
+            background: rgba(255, 255, 255, 0.18);
+        }
+
+        .jmp-page-nav-trigger:focus-visible,
+        .jmp-page-nav-arrow:focus-visible {
             outline: 2px solid #00a4dc;
             outline-offset: 2px;
         }
@@ -578,12 +691,17 @@ async function setLibraryPage(state, targetStartIndex) {
     return false;
 }
 
-function clickLibraryPagination(direction) {
+function findLibraryPaginationGroup() {
     const groups = Array.from(
         document.querySelectorAll('.MuiToolbar-root.padded-left .MuiButtonGroup-root')
     );
-    const group = groups.find(candidate => candidate.querySelector('svg[data-testid="NavigateNextIcon"]')) ||
-        groups[groups.length - 1];
+    return groups.find(group => group.querySelector('svg[data-testid="NavigateNextIcon"]')) ||
+        groups[groups.length - 1] ||
+        null;
+}
+
+function clickLibraryPagination(direction) {
+    const group = findLibraryPaginationGroup();
 
     let button;
     if (group) {
@@ -732,24 +850,103 @@ function clearPagePickerTrigger(chip) {
     chip.removeAttribute('aria-haspopup');
 }
 
+function createPageNav() {
+    const root = document.createElement('div');
+    root.className = PAGE_NAV_CLASS;
+
+    const makeNavButton = (direction, title) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'jmp-page-nav-arrow';
+        button.dataset.direction = direction;
+        button.title = title;
+        button.setAttribute('aria-label', title);
+        button.addEventListener('click', () => selectSiblingPage(direction === 'next' ? 1 : -1));
+        return button;
+    };
+
+    const previous = makeNavButton('previous', 'Previous page');
+
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'jmp-page-nav-trigger';
+    trigger.setAttribute(PAGE_PICKER_TRIGGER_ATTR, 'true');
+    trigger.setAttribute('aria-haspopup', 'dialog');
+    trigger.title = 'Select page';
+
+    const label = document.createElement('span');
+    label.className = 'jmp-page-nav-label';
+    trigger.appendChild(label);
+
+    const next = makeNavButton('next', 'Next page');
+
+    root.append(previous, trigger, next);
+    document.body.appendChild(root);
+
+    return { root, label, previous, next };
+}
+
+function selectSiblingPage(offset) {
+    const state = getPagePickerState(null);
+    if (!state) {
+        return;
+    }
+
+    const targetPage = state.currentPage + offset;
+    if (targetPage < 1 || targetPage > state.totalPages) {
+        return;
+    }
+
+    goToLibraryPage(state, targetPage).catch(error => {
+        console.error('Input Plugin: Failed to change the library page:', error);
+    });
+}
+
+function removePageNav() {
+    pageNav?.root.remove();
+    pageNav = null;
+    document.body.classList.remove(PAGE_NAV_BODY_CLASS);
+    findLibraryPaginationGroup()?.removeAttribute(PAGINATION_HIDDEN_ATTR);
+}
+
+function updatePageNav() {
+    const state = getPagePickerState(null);
+    if (!state) {
+        removePageNav();
+        return;
+    }
+
+    if (!pageNav) {
+        pageNav = createPageNav();
+    }
+
+    const { label, previous, next } = pageNav;
+    if (label.textContent !== state.label) {
+        label.textContent = state.label;
+    }
+    previous.disabled = state.currentPage <= 1;
+    next.disabled = state.currentPage >= state.totalPages;
+    document.body.classList.add(PAGE_NAV_BODY_CLASS);
+    findLibraryPaginationGroup()?.setAttribute(PAGINATION_HIDDEN_ATTR, 'true');
+}
+
 function ensurePagePickerTrigger() {
     const chip = document.querySelector('.MuiToolbar-root.padded-left .MuiChip-root');
-    if (!chip) {
-        return;
-    }
+    const visibleRange = document.querySelector('.libraryPage') ? getVisiblePageRange() : null;
 
-    if (!document.querySelector('.libraryPage') || !getVisiblePageRange()) {
-        clearPagePickerTrigger(chip);
-        return;
-    }
-
-    if (!chip.hasAttribute(PAGE_PICKER_TRIGGER_ATTR)) {
+    if (!visibleRange) {
+        if (chip) {
+            clearPagePickerTrigger(chip);
+        }
+    } else if (chip && !chip.hasAttribute(PAGE_PICKER_TRIGGER_ATTR)) {
         chip.setAttribute(PAGE_PICKER_TRIGGER_ATTR, 'true');
         chip.setAttribute('role', 'button');
         chip.setAttribute('tabindex', '0');
         chip.setAttribute('title', 'Select page');
         chip.setAttribute('aria-haspopup', 'dialog');
     }
+
+    updatePageNav();
 }
 
 function schedulePagePickerTriggerUpdate() {
@@ -798,9 +995,15 @@ function initPagePicker() {
     window.addEventListener('keydown', handlePagePickerKeyDown, true);
     window.addEventListener('hashchange', removePagePicker);
     document.addEventListener('viewshow', removePagePicker, true);
+    window.addEventListener('hashchange', schedulePagePickerTriggerUpdate);
+    document.addEventListener('viewshow', schedulePagePickerTriggerUpdate, true);
 
     pagePickerTriggerObserver = new MutationObserver(schedulePagePickerTriggerUpdate);
-    pagePickerTriggerObserver.observe(document.body, { childList: true, subtree: true });
+    pagePickerTriggerObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true
+    });
     ensurePagePickerTrigger();
 }
 
