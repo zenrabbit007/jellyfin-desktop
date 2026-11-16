@@ -1,6 +1,7 @@
 #include "TrickplayWorker.h"
 
 #include <QCoreApplication>
+#include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -438,11 +439,16 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
 
   applyScale(width);
 
+  QElapsedTimer timer;
+  timer.start();
+
   if (!loadUrl(id, url, error)) {
     if (!isCancelled(id))
       emit failed(id, cacheKey, error);
     return;
   }
+
+  const qint64 loadMs = timer.restart();
 
   QByteArray jpeg;
   int frameWidth = 0;
@@ -456,6 +462,8 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
       emit failed(id, cacheKey, error);
     return;
   }
+
+  qDebug() << "Trickplay frame ready at" << positionMs << "ms: load" << loadMs << "ms, seek" << timer.elapsed() << "ms";
 
   const QString dataUrl = QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(jpeg.toBase64());
 

@@ -1,8 +1,8 @@
 (function() {
 // Replaces the server-generated trickplay images in the video OSD with frames
-// that are extracted on demand from the stream by the native player. Server
-// trickplay is still used when it is available; this is the fallback for items
-// that were never processed by the Jellyfin trickplay scheduled task.
+// that are extracted on demand from the stream by the native player. While the
+// setting is enabled the native frames are always used, even for items that the
+// Jellyfin trickplay scheduled task already processed.
 const REQUEST_WIDTH = 400;
 const BUBBLE_MAX_WIDTH = 320;
 const BUBBLE_MAX_HEIGHT = 220;
@@ -13,7 +13,11 @@ const CACHE_LIMIT = 500;
 const NEARBY_BUCKETS = 3;
 const PREFETCH_FRAMES = 2;
 const PREFETCH_DELAY_MS = 350;
-const IN_FLIGHT_TIMEOUT_MS = 5000;
+// The worker answers every request it receives, but a lost answer must not block
+// previews for good. This has to stay above the worker's own load + seek budget
+// (30s + 15s), otherwise big/slow files get superseded while they are still
+// being read and never produce a frame.
+const IN_FLIGHT_TIMEOUT_MS = 50000;
 const REQUEST_TIMEOUT_MS = 60000;
 
 function formatTime(ms) {
@@ -33,16 +37,6 @@ function isPreviewEnabled() {
     // Client Settings > Video > Seek Bar Previews. Missing settings (older
     // configs) keep the feature on.
     return window.jmpInfo?.settings?.video?.trickplay_preview !== false;
-}
-
-function backgroundUrl(element) {
-    const value = element.style.backgroundImage || window.getComputedStyle(element).backgroundImage;
-    if (!value || value === 'none') {
-        return null;
-    }
-
-    const match = /url\((['"]?)(.*?)\1\)/.exec(value);
-    return match && match[2] ? match[2] : null;
 }
 
 function splitKey(key) {
@@ -95,12 +89,22 @@ class trickplayPlugin {
         this.inFlight = null;
         this.prefetchTimer = undefined;
         this.warnedNoInfo = false;
-        this.goodTiles = new Set();
-        this.badTiles = new Set();
-        this.probingTiles = new Set();
+        this.loggedFailures = new Set();
+        this.loggedItem = null;
+        this.loggedRequestItem = null;
+        this.wrappedUpdateBubbleHtml = null;
+        this.loggedRender = null;
+        this.loggedSkip = null;
+        this.loggedImageItem = null;
+        this.lastHoverLogAt = 0;
+        this.originalUpdateBubbleHtml = null;
         this.lastFrame = null;
         this.direction = 1;
         this.patchScheduled = false;
+        this.patchCount = 0;
+        this.loggedHookItem = null;
+        this.loggedDisabled = false;
+        this.loggedBadValue = false;
 
         document.addEventListener('viewshow', () => this.schedulePatch(), true);
         document.addEventListener('DOMContentLoaded', () => this.schedulePatch(), { once: true });
@@ -115,6 +119,12 @@ class trickplayPlugin {
         }
 
         void this.init();
+
+        // The client assigns its bubble handler once per playback, and the seek
+        // bar it belongs to can be replaced (or lose our accessor) without any
+        // DOM mutation the observer would see. A cheap identity check keeps the
+        // hook alive for the second and every later video of a session.
+        window.setInterval(() => this.patchSlider(), 500);
     }
 
     async init() {
@@ -133,8 +143,8 @@ class trickplayPlugin {
         this.api.trickplay.thumbnailReady.connect((cacheKey, dataUrl, width, height) => {
             this.onThumbnailReady(cacheKey, dataUrl, width, height);
         });
-        this.api.trickplay.thumbnailFailed.connect((cacheKey) => {
-            this.onThumbnailFailed(cacheKey);
+        this.api.trickplay.thumbnailFailed.connect((cacheKey, reason) => {
+            this.onThumbnailFailed(cacheKey, reason);
         });
 
         // Turning the setting off should stop background prefetching right
@@ -162,114 +172,67 @@ class trickplayPlugin {
 
     patchSlider() {
         const slider = document.querySelector('#videoOsdPage .osdPositionSlider');
-        if (!slider || slider === this.slider) {
+        if (!slider) {
+            return;
+        }
+
+        // Only skip while our wrapper is still the live handler. The client
+        // drops it between playbacks (deleting the property or assigning the
+        // prototype method again), which an "already patched" marker on the
+        // element cannot detect; a silent miss means no previews at all.
+        if (slider === this.slider && slider.updateBubbleHtml === this.wrappedUpdateBubbleHtml) {
             return;
         }
 
         this.slider = slider;
+        this.originalUpdateBubbleHtml = slider.updateBubbleHtml === this.wrappedUpdateBubbleHtml
+            ? this.originalUpdateBubbleHtml
+            : slider.updateBubbleHtml;
 
-        if (slider.dataset.jmpTrickplayPatched === '1') {
-            return;
-        }
-        slider.dataset.jmpTrickplayPatched = '1';
+        this.patchCount += 1;
+        console.info('Trickplay Preview: hooked the seek bar (' + this.patchCount + (
+            this.patchCount === 1 ? ')' : ', the client had dropped the previous handler)'
+        ));
 
-        let originalUpdateBubbleHtml = slider.updateBubbleHtml;
         const plugin = this;
-
         const wrapped = function(bubble, value) {
-            const handled = typeof originalUpdateBubbleHtml === 'function'
-                ? originalUpdateBubbleHtml.call(this, bubble, value)
-                : false;
-
-            if (handled && plugin.serverTrickplayUsable(bubble)) {
-                // The server has real trickplay images for this item: drop our
-                // state (and styling) so the client's bubble is left alone.
-                plugin.stopPreviewing(bubble);
-                return true;
+            const original = plugin.originalUpdateBubbleHtml;
+            if (typeof original === 'function') {
+                // Run the client's handler first: it sizes and positions the
+                // bubble. The preview below then replaces its content.
+                original.call(this, bubble, value);
             }
 
             return plugin.onSliderBubbleUpdate(this, bubble, value);
         };
 
+        this.wrappedUpdateBubbleHtml = wrapped;
+
         // The video player assigns updateBubbleHtml whenever the OSD view is
         // initialized, and it is called both while hovering and while dragging
-        // the slider. Use an accessor so the wrapper survives re-assignment.
-        Object.defineProperty(slider, 'updateBubbleHtml', {
-            configurable: true,
-            enumerable: true,
-            get() {
-                return wrapped;
-            },
-            set(fn) {
-                originalUpdateBubbleHtml = fn;
-            }
-        });
-    }
-
-    serverTrickplayUsable(bubble) {
-        // The client puts the sprite image on .chapterThumb, inside
-        // .chapterThumbWrapper, and different versions size one or the other.
-        const candidates = bubble.querySelectorAll('.chapterThumbWrapper, .chapterThumb');
-        let pendingUrl = null;
-
-        for (const element of candidates) {
-            const url = backgroundUrl(element);
-            if (!url) {
-                continue;
-            }
-
-            if (url.indexOf('NaN') !== -1 || url.indexOf('undefined') !== -1) {
-                // Items without server trickplay data still get a bubble like
-                // this, built from missing information.
-                return false;
-            }
-
-            if (this.goodTiles.has(url)) {
-                return true;
-            }
-
-            if (this.badTiles.has(url)) {
-                continue;
-            }
-
-            if (!pendingUrl) {
-                pendingUrl = url;
-            }
+        // the slider. An accessor keeps the wrapper in place across those
+        // assignments.
+        try {
+            Object.defineProperty(slider, 'updateBubbleHtml', {
+                configurable: true,
+                enumerable: true,
+                get() {
+                    return wrapped;
+                },
+                set(fn) {
+                    plugin.originalUpdateBubbleHtml = fn;
+                }
+            });
+        } catch (error) {
+            console.error('Trickplay Preview: could not hook the seek bar', error);
         }
-
-        if (pendingUrl) {
-            // Until the server proves it can serve this image, show our own
-            // frame instead of an empty box.
-            this.probeServerTile(pendingUrl);
-        }
-
-        return false;
-    }
-
-    probeServerTile(url) {
-        if (this.probingTiles.has(url)) {
-            return;
-        }
-
-        this.probingTiles.add(url);
-
-        const image = new Image();
-        image.onload = () => {
-            this.probingTiles.delete(url);
-            this.goodTiles.add(url);
-        };
-        image.onerror = () => {
-            this.probingTiles.delete(url);
-            this.badTiles.add(url);
-            console.info('Trickplay Preview: server trickplay image unavailable, generating frames instead');
-        };
-        image.src = url;
     }
 
     getPlaybackInfo() {
         const playbackManager = this.playbackManager;
         const player = playbackManager?._currentPlayer;
 
+        this.noPreviewReason = 'no player';
         if (!player) {
             return null;
         }
@@ -278,28 +241,35 @@ class trickplayPlugin {
         try {
             state = playbackManager.getPlayerState(player);
         } catch (error) {
+            this.noPreviewReason = 'no player state';
             return null;
         }
 
         const item = state?.NowPlayingItem;
         if (!item || item.MediaType !== 'Video') {
+            this.noPreviewReason = 'not a video';
             return null;
         }
 
         // Live streams have no fixed timeline to preview.
         if (item.Type === 'TvChannel' || item.IsLive) {
+            this.noPreviewReason = 'live stream';
             return null;
         }
 
         const durationTicks = item.RunTimeTicks || state.MediaSource?.RunTimeTicks || 0;
         if (!(durationTicks > 0)) {
+            this.noPreviewReason = 'unknown duration';
             return null;
         }
 
         const url = typeof player.currentSrc === 'function' ? player.currentSrc() : player._currentSrc;
         if (!url) {
+            this.noPreviewReason = 'no stream url';
             return null;
         }
+
+        this.noPreviewReason = null;
 
         const mediaSourceId = state.MediaSource?.Id || item.Id;
         const durationMs = durationTicks / 10000;
@@ -318,17 +288,25 @@ class trickplayPlugin {
 
     onSliderBubbleUpdate(slider, bubble, value) {
         if (!this.api?.trickplay || !isPreviewEnabled()) {
+            if (!this.loggedDisabled) {
+                this.loggedDisabled = true;
+                console.info('Trickplay Preview: hook ran but previews are off ('
+                    + (!this.api?.trickplay ? 'native component unavailable' : 'setting disabled') + ')');
+            }
+
             if (this.hover || this.prefetchQueue.length) {
                 this.stopPreviewing(bubble);
             }
             return false;
         }
 
+        this.loggedDisabled = false;
+
         const info = this.getPlaybackInfo();
         if (!info) {
             if (!this.warnedNoInfo) {
                 this.warnedNoInfo = true;
-                console.info('Trickplay Preview: nothing to preview for the current playback');
+                console.info('Trickplay Preview: nothing to preview (' + (this.noPreviewReason || 'unknown') + ')');
             }
             this.hover = null;
             this.prefetchQueue = [];
@@ -337,10 +315,22 @@ class trickplayPlugin {
 
         this.warnedNoInfo = false;
 
+        if (this.loggedHookItem !== info.cacheKey) {
+            this.loggedHookItem = info.cacheKey;
+            console.info('Trickplay Preview: hook is active for item ' + info.item.Id);
+        }
+
         const positionMs = info.durationMs * value / 100;
         if (!Number.isFinite(positionMs) || positionMs < 0) {
+            if (!this.loggedBadValue) {
+                this.loggedBadValue = true;
+                console.info('Trickplay Preview: unusable slider value ' + value
+                    + ' (duration ' + info.durationMs + ' ms)');
+            }
             return false;
         }
+
+        this.loggedBadValue = false;
 
         const bucket = Math.floor(positionMs / info.interval) * info.interval;
 
@@ -353,6 +343,7 @@ class trickplayPlugin {
         const cached = this.cache.get(key);
 
         this.hover = { bubble, key, positionMs, info, slider };
+        this.logHover(bucket, cached ? 'cached' : (this.findNearby(info, bucket) ? 'nearby' : (this.lastFrameThumbnail(info) ? 'last' : 'none')));
 
         if (cached) {
             this.renderThumbnail(slider, bubble, info, positionMs, cached);
@@ -373,6 +364,31 @@ class trickplayPlugin {
 
         this.requestThumbnail(info, bucket, key, false);
         return true;
+    }
+
+    logHover(bucket, source) {
+        const now = performance.now();
+        if (this.lastHoverLogAt && now - this.lastHoverLogAt < 300) {
+            this.lastHoverLogSource = source;
+            return;
+        }
+
+        this.lastHoverLogAt = now;
+        console.info('Trickplay Preview: hover ' + formatTime(bucket) + ' served from ' + source);
+    }
+
+    verifyImage(bubble, info) {
+        if (this.loggedImageItem === info.cacheKey) {
+            return;
+        }
+
+        this.loggedImageItem = info.cacheKey;
+        window.requestAnimationFrame(() => {
+            const image = bubble.querySelector('.jmpTpImage');
+            console.info(
+                'Trickplay Preview: image ' + (image ? image.naturalWidth + 'x' + image.naturalHeight + ' complete=' + image.complete : 'missing')
+            );
+        });
     }
 
     renderDefaultBubble(slider, bubble, value, positionMs) {
@@ -416,6 +432,19 @@ class trickplayPlugin {
                     'text-shadow:0 1px 3px rgba(0,0,0,0.95);">' +
                     formatTime(positionMs) + '</div>' +
             '</div>';
+
+        this.verifyImage(bubble, info);
+
+        if (this.loggedRender !== info.cacheKey) {
+            this.loggedRender = info.cacheKey;
+            const style = window.getComputedStyle(bubble);
+            console.info(
+                'Trickplay Preview: rendered ' + width + 'x' + height + ' into a '
+                + Math.round(bubble.offsetWidth) + 'x' + Math.round(bubble.offsetHeight)
+                + ' bubble (display ' + style.display + ', visibility ' + style.visibility
+                + ', hidden ' + bubble.classList.contains('hide') + ')'
+            );
+        }
 
         // The slider positions the bubble before filling it, so its width may
         // have changed by now. Re-center it with the new size.
@@ -528,6 +557,13 @@ class trickplayPlugin {
             return;
         }
 
+        // The frame under the pointer is still being generated. Dispatching it
+        // again supersedes the request in the worker, so the work restarts from
+        // the beginning -- on a large (4K) file it would never finish.
+        if (this.inFlight && this.inFlight.key === key) {
+            return;
+        }
+
         // Let the request that is already running finish. Cancelling it on
         // every pointermove means no frame is ever produced while the pointer
         // moves -- the next one starts from scratch again. When it is done,
@@ -551,6 +587,11 @@ class trickplayPlugin {
         // dropped will never be answered.
         for (const pendingKey of Array.from(this.pending.keys())) {
             this.clearPending(pendingKey);
+        }
+
+        if (this.loggedRequestItem !== info.cacheKey) {
+            this.loggedRequestItem = info.cacheKey;
+            console.info('Trickplay Preview: requesting a frame at ' + formatTime(bucket));
         }
 
         this.lastRequestedKey = key;
@@ -601,6 +642,10 @@ class trickplayPlugin {
         this.storeThumbnail(cacheKey, { dataUrl, width, height });
 
         const { itemKey, bucket } = splitKey(cacheKey);
+        if (this.loggedItem !== itemKey) {
+            this.loggedItem = itemKey;
+            console.info('Trickplay Preview: frames are being generated for this item');
+        }
         this.lastFrame = { itemKey, thumbnail: this.cache.get(cacheKey) };
 
         const hover = this.hover;
@@ -626,13 +671,27 @@ class trickplayPlugin {
         this.inFlight = null;
     }
 
-    onThumbnailFailed(cacheKey) {
+    onThumbnailFailed(cacheKey, reason) {
+        // The worker has no other way to report why a video produced no frame,
+        // log every distinct reason once so a failing video can be diagnosed.
+        const failure = reason || 'unknown';
+        if (!this.loggedFailures.has(failure)) {
+            this.loggedFailures.add(failure);
+            console.info('Trickplay Preview: native preview failed: ' + failure);
+        }
         this.clearPending(cacheKey);
         this.dropSupersededRequest(cacheKey);
         if (this.lastRequestedKey === cacheKey) {
             this.lastRequestedKey = null;
         }
-        this.requestHoveredThumbnail();
+
+        // Only chase the pointer again when the failure was not for the frame
+        // under it. Retrying the hovered frame right away would spin on a video
+        // the worker cannot read.
+        if (this.hover?.key !== cacheKey) {
+            this.requestHoveredThumbnail();
+        }
+
         this.pumpPrefetch();
     }
 
@@ -662,6 +721,12 @@ class trickplayPlugin {
         bubble.style.borderRadius = '';
         bubble.style.boxShadow = '';
         bubble.style.overflow = '';
+
+        if (bubble.querySelector('.jmpTpBubble')) {
+            // Our preview is still in the bubble; the client rebuilds it on the
+            // next update, but it must not linger while previews are off.
+            bubble.innerHTML = '';
+        }
     }
 
     lastFrameThumbnail(info) {
@@ -675,7 +740,11 @@ class trickplayPlugin {
         }
 
         const { bubble, info, positionMs, slider, key } = hover;
-        if (!bubble.isConnected || bubble.classList.contains('hide')) {
+        if (!bubble.isConnected) {
+            if (this.loggedSkip !== info.cacheKey) {
+                this.loggedSkip = info.cacheKey;
+                console.info('Trickplay Preview: frame ready but the bubble is detached');
+            }
             return;
         }
 
