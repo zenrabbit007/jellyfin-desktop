@@ -21,6 +21,7 @@ add_subdirectory(system)
 add_subdirectory(settings)
 add_subdirectory(power)
 add_subdirectory(taskbar)
+add_subdirectory(trickplay)
 
 if(LINUX_DBUS)
   add_subdirectory(mpris)

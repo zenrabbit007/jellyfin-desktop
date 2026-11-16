@@ -19,6 +19,7 @@ const features = [
 const getPlugins = () => {
     const basePlugins = [
         'inputPlugin',
+        'trickplayPlugin',
         'updatePlugin'
     ];
 
