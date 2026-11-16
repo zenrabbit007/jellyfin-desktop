@@ -108,6 +108,7 @@ const PAGE_PICKER_TRIGGER_ATTR = 'data-jmp-page-picker-trigger';
 const PAGE_PICKER_OVERLAY_CLASS = 'jmp-page-picker';
 const PAGE_PICKER_STYLE_ID = 'jmp-page-picker-style';
 const PAGE_NAV_CLASS = 'jmp-page-nav';
+const PAGE_NAV_HOST_CLASS = 'jmp-page-nav-host';
 const PAGE_NAV_BODY_CLASS = 'jmp-has-page-nav';
 const PAGINATION_HIDDEN_ATTR = 'data-jmp-pagination-hidden';
 const DEFAULT_LIBRARY_PAGE_SIZE = 100;
@@ -115,7 +116,7 @@ const DEFAULT_LIBRARY_PAGE_SIZE = 100;
 let pagePickerOverlay = null;
 let pagePickerState = null;
 let pagePickerTriggerObserver = null;
-let pagePickerTriggerFrame = null;
+let pagePickerTriggerScheduled = false;
 let pageNav = null;
 
 function getCurrentLibraryId() {
@@ -238,28 +239,38 @@ function injectPagePickerStyle() {
             display: none !important;
         }
 
+        .${PAGE_NAV_HOST_CLASS} {
+            position: relative;
+        }
+
         .${PAGE_NAV_CLASS} {
-            position: fixed;
-            top: 12px;
+            position: absolute;
+            top: 50%;
             left: 50%;
-            z-index: 9000;
+            z-index: 2;
             display: flex;
             align-items: center;
             gap: 2px;
-            padding: 4px 5px;
+            padding: 3px 4px;
             border-radius: 999px;
-            background: rgba(26, 26, 26, 0.94);
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.08);
-            backdrop-filter: blur(12px);
-            transform: translateX(-50%);
+            background: rgba(255, 255, 255, 0.08);
+            transform: translate(-50%, -50%);
+        }
+
+        @media (max-width: 68em) {
+            .${PAGE_NAV_CLASS} {
+                position: static;
+                margin-left: 0.5em;
+                transform: none;
+            }
         }
 
         .jmp-page-nav-arrow {
             display: flex;
             align-items: center;
             justify-content: center;
-            width: 2rem;
-            height: 2rem;
+            width: 1.75rem;
+            height: 1.75rem;
             padding: 0;
             border: 0;
             border-radius: 50%;
@@ -301,8 +312,8 @@ function injectPagePickerStyle() {
         .jmp-page-nav-trigger {
             display: flex;
             align-items: center;
-            height: 2rem;
-            padding: 0 12px;
+            height: 1.75rem;
+            padding: 0 10px;
             border: 0;
             border-radius: 999px;
             background: transparent;
@@ -850,7 +861,15 @@ function clearPagePickerTrigger(chip) {
     chip.removeAttribute('aria-haspopup');
 }
 
-function createPageNav() {
+function findLibraryToolbar() {
+    // The app bar has its own `padded-left` toolbar, so anchor on the pagination
+    // controls and range chip that only exist in the library header row.
+    const anchor = findLibraryPaginationGroup() ||
+        document.querySelector('.MuiToolbar-root.padded-left .MuiChip-root');
+    return anchor?.closest('.MuiToolbar-root') || null;
+}
+
+function createPageNav(host) {
     const root = document.createElement('div');
     root.className = PAGE_NAV_CLASS;
 
@@ -881,9 +900,21 @@ function createPageNav() {
     const next = makeNavButton('next', 'Next page');
 
     root.append(previous, trigger, next);
-    document.body.appendChild(root);
+    host.classList.add(PAGE_NAV_HOST_CLASS);
 
-    return { root, label, previous, next };
+    // Place the nav next to the header row's own controls so the static
+    // narrow-window fallback still lands between the title and the actions.
+    let rowItem = host.querySelector('.MuiChip-root');
+    while (rowItem && rowItem.parentElement !== host) {
+        rowItem = rowItem.parentElement;
+    }
+    if (rowItem) {
+        rowItem.after(root);
+    } else {
+        host.appendChild(root);
+    }
+
+    return { root, host, label, previous, next };
 }
 
 function selectSiblingPage(offset) {
@@ -904,6 +935,7 @@ function selectSiblingPage(offset) {
 
 function removePageNav() {
     pageNav?.root.remove();
+    pageNav?.host?.classList.remove(PAGE_NAV_HOST_CLASS);
     pageNav = null;
     document.body.classList.remove(PAGE_NAV_BODY_CLASS);
     findLibraryPaginationGroup()?.removeAttribute(PAGINATION_HIDDEN_ATTR);
@@ -911,13 +943,15 @@ function removePageNav() {
 
 function updatePageNav() {
     const state = getPagePickerState(null);
-    if (!state) {
+    const host = state ? findLibraryToolbar() : null;
+    if (!host) {
         removePageNav();
         return;
     }
 
-    if (!pageNav) {
-        pageNav = createPageNav();
+    if (!pageNav || pageNav.host !== host) {
+        removePageNav();
+        pageNav = createPageNav(host);
     }
 
     const { label, previous, next } = pageNav;
@@ -950,11 +984,12 @@ function ensurePagePickerTrigger() {
 }
 
 function schedulePagePickerTriggerUpdate() {
-    if (pagePickerTriggerFrame !== null) {
+    if (pagePickerTriggerScheduled) {
         return;
     }
-    pagePickerTriggerFrame = window.requestAnimationFrame(() => {
-        pagePickerTriggerFrame = null;
+    pagePickerTriggerScheduled = true;
+    queueMicrotask(() => {
+        pagePickerTriggerScheduled = false;
         ensurePagePickerTrigger();
     });
 }
