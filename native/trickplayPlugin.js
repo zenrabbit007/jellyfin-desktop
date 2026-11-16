@@ -92,12 +92,13 @@ class trickplayPlugin {
         this.loggedFailures = new Set();
         this.loggedItem = null;
         this.loggedRequestItem = null;
-        this.wrappedUpdateBubbleHtml = null;
         this.loggedRender = null;
         this.loggedSkip = null;
         this.loggedImageItem = null;
         this.lastHoverLogAt = 0;
-        this.originalUpdateBubbleHtml = null;
+        this.hooks = new WeakMap();
+        this.loggedStaleOsd = false;
+        this.loggedHandlerError = null;
         this.lastFrame = null;
         this.direction = 1;
         this.patchScheduled = false;
@@ -171,42 +172,63 @@ class trickplayPlugin {
     }
 
     patchSlider() {
-        const slider = document.querySelector('#videoOsdPage .osdPositionSlider');
-        if (!slider) {
+        // Every playback loads the video OSD again, and the page of the
+        // previous one can stay in the document. A plain querySelector then
+        // keeps returning the seek bar of that dead page, which is why previews
+        // only worked for the first video of a session.
+        const sliders = document.querySelectorAll('#videoOsdPage .osdPositionSlider');
+
+        for (let index = 0; index < sliders.length; ++index) {
+            this.hookSlider(sliders[index]);
+        }
+
+        if (sliders.length > 1 && !this.loggedStaleOsd) {
+            this.loggedStaleOsd = true;
+            console.info('Trickplay Preview: ' + sliders.length
+                + ' video OSD pages are in the document, watching all of their seek bars');
+        }
+    }
+
+    hookSlider(slider) {
+        let record = this.hooks.get(slider);
+
+        if (record && slider.updateBubbleHtml === record.wrapped) {
+            this.slider = slider;
             return;
         }
 
-        // Only skip while our wrapper is still the live handler. The client
-        // drops it between playbacks (deleting the property or assigning the
-        // prototype method again), which an "already patched" marker on the
-        // element cannot detect; a silent miss means no previews at all.
-        if (slider === this.slider && slider.updateBubbleHtml === this.wrappedUpdateBubbleHtml) {
-            return;
+        const plugin = this;
+
+        if (!record) {
+            // Adopt the handler the client installed before we got here.
+            record = { original: slider.updateBubbleHtml || null };
+
+            record.wrapped = function(bubble, value) {
+                if (typeof record.original === 'function') {
+                    // Run the client's handler first: it sizes and positions
+                    // the bubble. The preview below then replaces its content.
+                    try {
+                        record.original.call(this, bubble, value);
+                    } catch (error) {
+                        // The handler of a closed playback must not take the
+                        // preview down with it.
+                        if (plugin.loggedHandlerError !== String(error)) {
+                            plugin.loggedHandlerError = String(error);
+                            console.info('Trickplay Preview: the client bubble handler failed (' + error + ')');
+                        }
+                    }
+                }
+
+                return plugin.onSliderBubbleUpdate(this, bubble, value);
+            };
+
+            this.hooks.set(slider, record);
+        } else {
+            // The client replaced the property, so our accessor is gone.
+            record.original = slider.updateBubbleHtml;
         }
 
         this.slider = slider;
-        this.originalUpdateBubbleHtml = slider.updateBubbleHtml === this.wrappedUpdateBubbleHtml
-            ? this.originalUpdateBubbleHtml
-            : slider.updateBubbleHtml;
-
-        this.patchCount += 1;
-        console.info('Trickplay Preview: hooked the seek bar (' + this.patchCount + (
-            this.patchCount === 1 ? ')' : ', the client had dropped the previous handler)'
-        ));
-
-        const plugin = this;
-        const wrapped = function(bubble, value) {
-            const original = plugin.originalUpdateBubbleHtml;
-            if (typeof original === 'function') {
-                // Run the client's handler first: it sizes and positions the
-                // bubble. The preview below then replaces its content.
-                original.call(this, bubble, value);
-            }
-
-            return plugin.onSliderBubbleUpdate(this, bubble, value);
-        };
-
-        this.wrappedUpdateBubbleHtml = wrapped;
 
         // The video player assigns updateBubbleHtml whenever the OSD view is
         // initialized, and it is called both while hovering and while dragging
@@ -217,15 +239,21 @@ class trickplayPlugin {
                 configurable: true,
                 enumerable: true,
                 get() {
-                    return wrapped;
+                    return record.wrapped;
                 },
                 set(fn) {
-                    plugin.originalUpdateBubbleHtml = fn;
+                    record.original = fn;
                 }
             });
         } catch (error) {
             console.error('Trickplay Preview: could not hook the seek bar', error);
+            return;
         }
+
+        this.patchCount += 1;
+        console.info('Trickplay Preview: hooked the seek bar (' + this.patchCount + (
+            this.patchCount === 1 ? ')' : ', the client had changed the handler)'
+        ));
     }
 
     getPlaybackInfo() {
