@@ -302,6 +302,11 @@
         "hidden": true
       },
       {
+        "value": "debug.trickplay_timings",
+        "default": false,
+        "hidden": true
+      },
+      {
         "value": "refreshrate.auto_switch",
         "display_name": "Display Refresh Rate Sync",
         "help": "Sets the display refresh rate to the media refresh rate. The default is disabled.",

@@ -26,11 +26,13 @@ QString mpvErrorString(int error)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-TrickplayWorker::TrickplayWorker(bool ignoreSslErrors, const QString& caFile, const QString& userAgent, QObject* parent)
+TrickplayWorker::TrickplayWorker(bool ignoreSslErrors, const QString& caFile, const QString& userAgent,
+                                 bool logTimings, QObject* parent)
   : QObject(parent)
   , m_ignoreSslErrors(ignoreSslErrors)
   , m_caFile(caFile)
   , m_userAgent(userAgent)
+  , m_logTimings(logTimings)
 {
   m_cache.setMaxCost(kCacheEntries);
   m_tempDir = QDir(QDir::tempPath()).filePath(
@@ -463,7 +465,8 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
     return;
   }
 
-  qDebug() << "Trickplay frame ready at" << positionMs << "ms: load" << loadMs << "ms, seek" << timer.elapsed() << "ms";
+  if (m_logTimings)
+    qDebug() << "Trickplay frame ready at" << positionMs << "ms: load" << loadMs << "ms, seek" << timer.elapsed() << "ms";
 
   const QString dataUrl = QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(jpeg.toBase64());
 

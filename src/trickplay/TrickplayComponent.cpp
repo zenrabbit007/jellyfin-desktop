@@ -46,11 +46,13 @@ void TrickplayComponent::ensureWorker()
   m_thread->setObjectName(QStringLiteral("TrickplayWorker"));
 
   bool ignoreSslErrors = false;
+  bool logTimings = false;
   QString caFile;
 
   // Settings are not available in every context (for example unit tests).
   if (SettingsComponent::Get().getSection(SETTINGS_SECTION_MAIN)) {
     ignoreSslErrors = SettingsComponent::Get().ignoreSSLErrors();
+    logTimings = SettingsComponent::Get().value(SETTINGS_SECTION_VIDEO, "debug.trickplay_timings").toBool();
 
 #if !defined(Q_OS_WIN) && !defined(Q_OS_MAC)
     if (!ignoreSslErrors && SettingsComponent::Get().autodetectCertBundle())
@@ -58,7 +60,7 @@ void TrickplayComponent::ensureWorker()
 #endif
   }
 
-  m_worker = new TrickplayWorker(ignoreSslErrors, caFile, SystemComponent::Get().getUserAgent());
+  m_worker = new TrickplayWorker(ignoreSslErrors, caFile, SystemComponent::Get().getUserAgent(), logTimings);
   m_worker->moveToThread(m_thread);
 
   connect(m_thread, &QThread::finished, m_worker, &QObject::deleteLater);

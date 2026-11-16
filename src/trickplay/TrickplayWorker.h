@@ -20,7 +20,8 @@ class TrickplayWorker : public QObject
   Q_OBJECT
 
 public:
-  explicit TrickplayWorker(bool ignoreSslErrors, const QString& caFile, const QString& userAgent, QObject* parent = nullptr);
+  explicit TrickplayWorker(bool ignoreSslErrors, const QString& caFile, const QString& userAgent,
+                           bool logTimings = false, QObject* parent = nullptr);
   ~TrickplayWorker() override;
 
   // Thread-safe. Lets the worker abandon a job that is no longer relevant.
@@ -58,6 +59,7 @@ private:
   bool m_ignoreSslErrors = false;
   QString m_caFile;
   QString m_userAgent;
+  bool m_logTimings = false;
   QString m_loadedUrl;
   QString m_tempDir;
   QCache<QString, Thumbnail> m_cache;
