@@ -6,20 +6,15 @@
 const REQUEST_WIDTH = 400;
 const BUBBLE_MAX_WIDTH = 320;
 const BUBBLE_MAX_HEIGHT = 220;
-const SHORT_VIDEO_MS = 15 * 60 * 1000;
+const SHORT_VIDEO_MS = 30 * 60 * 1000;
 const SHORT_VIDEO_INTERVAL_MS = 5000;
 const LONG_VIDEO_INTERVAL_MS = 10000;
-const CACHE_LIMIT = 300;
+const CACHE_LIMIT = 500;
+const NEARBY_BUCKETS = 3;
+const PREFETCH_FRAMES = 2;
+const PREFETCH_DELAY_MS = 350;
+const IN_FLIGHT_TIMEOUT_MS = 5000;
 const REQUEST_TIMEOUT_MS = 60000;
-
-function escapeHtml(value) {
-    return String(value ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-}
 
 function formatTime(ms) {
     const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -32,6 +27,39 @@ function formatTime(ms) {
     }
 
     return minutes + ':' + String(seconds).padStart(2, '0');
+}
+
+function isPreviewEnabled() {
+    // Client Settings > Video > Seek Bar Previews. Missing settings (older
+    // configs) keep the feature on.
+    return window.jmpInfo?.settings?.video?.trickplay_preview !== false;
+}
+
+function serverTrickplayShown(bubble) {
+    // The client's own handler sizes this wrapper from the trickplay info the
+    // server sent. An item whose Trickplay map is empty ({}, which is truthy)
+    // makes it claim the bubble while leaving the wrapper without any size,
+    // i.e. nothing is actually shown.
+    const wrapper = bubble.querySelector('.chapterThumbWrapper, .chapterThumb');
+    if (!wrapper) {
+        return false;
+    }
+
+    if (parseFloat(wrapper.style.width) > 0 && parseFloat(wrapper.style.height) > 0) {
+        return true;
+    }
+
+    // Other client versions size the wrapper through CSS instead.
+    const background = window.getComputedStyle(wrapper).backgroundImage;
+    return !!background && background !== 'none' && wrapper.offsetWidth > 0 && wrapper.offsetHeight > 0;
+}
+
+function splitKey(key) {
+    const separator = key.lastIndexOf('|');
+    return {
+        itemKey: key.slice(0, separator),
+        bucket: Number(key.slice(separator + 1))
+    };
 }
 
 function repositionBubble(slider, bubble, positionMs, info) {
@@ -57,19 +85,6 @@ function repositionBubble(slider, bubble, positionMs, info) {
     bubble.style.left = left + 'px';
 }
 
-function findChapter(item, positionTicks) {
-    let chapter;
-
-    for (const current of item?.Chapters || []) {
-        if (positionTicks < current.StartPositionTicks) {
-            break;
-        }
-        chapter = current;
-    }
-
-    return chapter;
-}
-
 class trickplayPlugin {
     constructor({ playbackManager }) {
         this.name = 'Trickplay Preview';
@@ -81,8 +96,17 @@ class trickplayPlugin {
         this.slider = null;
         this.hover = null;
         this.cache = new Map();
+        this.bucketsByItem = new Map();
         this.pending = new Map();
+        this.prefetchQueue = [];
         this.lastRequestedKey = null;
+        this.lastBucket = null;
+        this.inFlight = null;
+        this.prefetchTimer = undefined;
+        this.warnedNoInfo = false;
+        this.warnedClientPreview = false;
+        this.lastFrame = null;
+        this.direction = 1;
         this.patchScheduled = false;
 
         document.addEventListener('viewshow', () => this.schedulePatch(), true);
@@ -120,6 +144,14 @@ class trickplayPlugin {
             this.onThumbnailFailed(cacheKey);
         });
 
+        // Turning the setting off should stop background prefetching right
+        // away, not only on the next pointer move.
+        window.jmpInfo?.settingsUpdate?.push((section) => {
+            if (section === 'video' && !isPreviewEnabled()) {
+                this.stopPreviewing();
+            }
+        });
+
         this.schedulePatch();
     }
 
@@ -137,16 +169,19 @@ class trickplayPlugin {
 
     patchSlider() {
         const slider = document.querySelector('#videoOsdPage .osdPositionSlider');
-        if (!slider || slider === this.slider) {
+        if (!slider) {
             return;
         }
 
         this.slider = slider;
 
-        if (slider.dataset.jmpTrickplayPatched === '1') {
+        // Re-hook whenever our wrapper is not the handler any more. The client
+        // rebuilds the OSD between playbacks and can replace the property
+        // outright (which drops an earlier hook), so trusting "already patched"
+        // flags left some videos without previews.
+        if (slider.updateBubbleHtml?.jmpTrickplayWrapper === true) {
             return;
         }
-        slider.dataset.jmpTrickplayPatched = '1';
 
         let originalUpdateBubbleHtml = slider.updateBubbleHtml;
         const plugin = this;
@@ -156,7 +191,12 @@ class trickplayPlugin {
                 ? originalUpdateBubbleHtml.call(this, bubble, value)
                 : false;
 
-            if (handled) {
+            if (handled && serverTrickplayShown(bubble)) {
+                // The server has real trickplay images for this item.
+                if (!plugin.warnedClientPreview) {
+                    plugin.warnedClientPreview = true;
+                    console.info('Trickplay Preview: the client drew its own preview');
+                }
                 plugin.hover = null;
                 return true;
             }
@@ -164,18 +204,27 @@ class trickplayPlugin {
             return plugin.onSliderBubbleUpdate(this, bubble, value);
         };
 
+        wrapped.jmpTrickplayWrapper = true;
+
         // The video player assigns updateBubbleHtml whenever the OSD view is
-        // initialized. Use an accessor so the wrapper survives re-assignment.
-        Object.defineProperty(slider, 'updateBubbleHtml', {
-            configurable: true,
-            enumerable: true,
-            get() {
-                return wrapped;
-            },
-            set(fn) {
-                originalUpdateBubbleHtml = fn;
-            }
-        });
+        // initialized, and it is called both while hovering and while dragging
+        // the slider. An accessor keeps the wrapper in place across those
+        // assignments.
+        try {
+            Object.defineProperty(slider, 'updateBubbleHtml', {
+                configurable: true,
+                enumerable: true,
+                get() {
+                    return wrapped;
+                },
+                set(fn) {
+                    originalUpdateBubbleHtml = fn;
+                }
+            });
+            console.info('Trickplay Preview: hooked the seek bar');
+        } catch (error) {
+            console.error('Trickplay Preview: could not hook the seek bar', error);
+        }
     }
 
     getPlaybackInfo() {
@@ -214,7 +263,8 @@ class trickplayPlugin {
         }
 
         const mediaSourceId = state.MediaSource?.Id || item.Id;
-        const interval = durationTicks / 10000 <= SHORT_VIDEO_MS
+        const durationMs = durationTicks / 10000;
+        const interval = durationMs <= SHORT_VIDEO_MS
             ? SHORT_VIDEO_INTERVAL_MS
             : LONG_VIDEO_INTERVAL_MS;
 
@@ -222,21 +272,32 @@ class trickplayPlugin {
             item,
             url,
             interval,
-            durationMs: durationTicks / 10000,
+            durationMs,
             cacheKey: (item.ServerId || '') + '|' + item.Id + '|' + mediaSourceId
         };
     }
 
     onSliderBubbleUpdate(slider, bubble, value) {
-        if (!this.api?.trickplay) {
+        if (!this.api?.trickplay || !isPreviewEnabled()) {
+            if (this.hover || this.prefetchQueue.length) {
+                this.stopPreviewing(bubble);
+            }
             return false;
         }
 
         const info = this.getPlaybackInfo();
         if (!info) {
+            if (!this.warnedNoInfo) {
+                this.warnedNoInfo = true;
+                console.info('Trickplay Preview: nothing to preview for the current playback');
+            }
             this.hover = null;
+            this.prefetchQueue = [];
             return false;
         }
+
+        this.warnedNoInfo = false;
+        this.warnedClientPreview = false;
 
         const positionMs = info.durationMs * value / 100;
         if (!Number.isFinite(positionMs) || positionMs < 0) {
@@ -244,6 +305,12 @@ class trickplayPlugin {
         }
 
         const bucket = Math.floor(positionMs / info.interval) * info.interval;
+
+        if (this.lastBucket !== null && bucket !== this.lastBucket) {
+            this.direction = bucket > this.lastBucket ? 1 : -1;
+        }
+        this.lastBucket = bucket;
+
         const key = info.cacheKey + '|' + bucket;
         const cached = this.cache.get(key);
 
@@ -251,13 +318,22 @@ class trickplayPlugin {
 
         if (cached) {
             this.renderThumbnail(slider, bubble, info, positionMs, cached);
+            this.schedulePrefetch(info, bucket);
             return true;
         }
 
-        // Keep the regular bubble (time/chapter) visible while the frame is
-        // generated in the native player.
-        this.renderDefaultBubble(slider, bubble, value, positionMs);
-        this.requestThumbnail(info, bucket, key);
+        // Keep an image in the bubble while the exact frame is generated:
+        // prefer a frame next to the pointer, otherwise the newest frame we
+        // have. Without this a drag would flash the plain time text.
+        const placeholder = this.findNearby(info, bucket) || this.lastFrameThumbnail(info);
+
+        if (placeholder) {
+            this.renderThumbnail(slider, bubble, info, positionMs, placeholder);
+        } else {
+            this.renderDefaultBubble(slider, bubble, value, positionMs);
+        }
+
+        this.requestThumbnail(info, bucket, key, false);
         return true;
     }
 
@@ -279,18 +355,28 @@ class trickplayPlugin {
         const scale = Math.min(BUBBLE_MAX_WIDTH / sourceWidth, BUBBLE_MAX_HEIGHT / sourceHeight);
         const width = Math.max(1, Math.round(sourceWidth * scale));
         const height = Math.max(1, Math.round(sourceHeight * scale));
-        const chapter = findChapter(info.item, Math.round(positionMs * 10000));
-        const chapterName = chapter?.Name ? escapeHtml(chapter.Name) : '';
+
+        // Styled inline, after YouTube's seek preview: a hairline white frame
+        // around a rounded thumbnail with the time below, and no box around
+        // the whole thing.
+        bubble.style.background = 'transparent';
+        bubble.style.borderRadius = '0';
+        bubble.style.boxShadow = 'none';
+        bubble.style.overflow = 'visible';
+        bubble.style.padding = '0';
 
         bubble.innerHTML =
-            '<div class="chapterThumbContainer" style="position:relative;width:' + width + 'px;">' +
-                '<div class="chapterThumbWrapper" style="overflow:hidden;width:' + width + 'px;height:' + height + 'px;background:#000;">' +
-                    '<img src="' + thumbnail.dataUrl + '" alt="" style="display:block;width:100%;height:100%;object-fit:contain;" />' +
+            '<div class="jmpTpBubble" style="display:flex;flex-direction:column;align-items:center;">' +
+                '<div class="jmpTpFrame" style="border:1px solid #fff;border-radius:9px;' +
+                    'overflow:hidden;line-height:0;">' +
+                    '<img class="jmpTpImage" src="' + thumbnail.dataUrl + '" alt="" ' +
+                        'style="display:block;width:' + width + 'px;height:' + height + 'px;' +
+                        'border-radius:8px;" />' +
                 '</div>' +
-                '<div class="chapterThumbTextContainer">' +
-                    '<div class="chapterThumbText chapterThumbText-dim">' + chapterName + '</div>' +
-                    '<h2 class="chapterThumbText">' + formatTime(positionMs) + '</h2>' +
-                '</div>' +
+                '<div class="jmpTpTime" style="margin-top:24px;color:#eee;font-size:1.05em;' +
+                    'font-weight:500;letter-spacing:0.01em;line-height:1.2;' +
+                    'text-shadow:0 1px 3px rgba(0,0,0,0.95);">' +
+                    formatTime(positionMs) + '</div>' +
             '</div>';
 
         // The slider positions the bubble before filling it, so its width may
@@ -300,25 +386,148 @@ class trickplayPlugin {
         });
     }
 
-    requestThumbnail(info, bucket, key) {
-        // Stay on the same bucket while the pointer moves: no need to ask
-        // again. Moving back to a key while another request is in flight does
-        // need a new request, because the native worker only keeps the latest
-        // one alive.
+    findNearby(info, bucket) {
+        const buckets = this.bucketsByItem.get(info.cacheKey);
+        if (!buckets) {
+            return null;
+        }
+
+        for (let step = 1; step <= NEARBY_BUCKETS; ++step) {
+            for (const offset of [step, -step]) {
+                const key = buckets.get(bucket + offset * info.interval);
+                if (key && this.cache.has(key)) {
+                    return this.cache.get(key);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    schedulePrefetch(info, bucket) {
+        // Fill the frames around the hovered position so moving the pointer --
+        // or dragging the slider -- finds them already cached.
+        const queue = [];
+        const seen = new Set();
+
+        for (let step = 1; step <= NEARBY_BUCKETS; ++step) {
+            for (const offset of [this.direction, -this.direction]) {
+                const target = bucket + offset * step * info.interval;
+                if (target < 0 || target > info.durationMs) {
+                    continue;
+                }
+
+                const key = info.cacheKey + '|' + target;
+                if (seen.has(key) || this.cache.has(key) || this.pending.has(key)) {
+                    continue;
+                }
+
+                seen.add(key);
+                queue.push({ info, bucket: target, key });
+                if (queue.length >= PREFETCH_FRAMES) {
+                    break;
+                }
+            }
+            if (queue.length >= PREFETCH_FRAMES) {
+                break;
+            }
+        }
+
+        this.prefetchQueue = queue;
+
+        // Only warm up the cache once the pointer has settled: prefetching
+        // while it moves would seek (and re-read) the stream for nothing.
+        if (this.prefetchTimer === undefined) {
+            this.prefetchTimer = window.setTimeout(() => {
+                this.prefetchTimer = undefined;
+                this.pumpPrefetch();
+            }, PREFETCH_DELAY_MS);
+        }
+    }
+
+    cancelPrefetchTimer() {
+        if (this.prefetchTimer !== undefined) {
+            window.clearTimeout(this.prefetchTimer);
+            this.prefetchTimer = undefined;
+        }
+    }
+
+    pumpPrefetch() {
+        if (this.pending.size > 0) {
+            // An interactive request is in flight; background work would
+            // cancel it. Resume once it is answered.
+            return;
+        }
+
+        const next = this.prefetchQueue.shift();
+        if (!next) {
+            return;
+        }
+
+        const current = this.getPlaybackInfo();
+        if (!current || current.cacheKey !== next.info.cacheKey) {
+            this.prefetchQueue = [];
+            return;
+        }
+
+        this.requestThumbnail(next.info, next.bucket, next.key, true);
+    }
+
+    requestThumbnail(info, bucket, key, background) {
+        if (background) {
+            if (this.cache.has(key) || this.pending.has(key)) {
+                return;
+            }
+            this.dispatchThumbnail(info, bucket, key);
+            return;
+        }
+
+        if (this.cache.has(key)) {
+            return;
+        }
+
         if (this.lastRequestedKey === key && this.pending.has(key)) {
             return;
         }
 
-        // The abandoned requests will never be answered, so drop them now
-        // instead of letting them block this key for the whole timeout.
+        // Let the request that is already running finish. Cancelling it on
+        // every pointermove means no frame is ever produced while the pointer
+        // moves -- the next one starts from scratch again. When it is done,
+        // requestHoveredThumbnail() asks for wherever the pointer is by then.
+        if (this.inFlight && this.inFlight.itemKey === info.cacheKey) {
+            const elapsed = performance.now() - this.inFlight.startedAt;
+
+            // An answer can get lost (superseded in the native worker, or the
+            // item changed under us). Never let that block previews for good.
+            if (elapsed < IN_FLIGHT_TIMEOUT_MS) {
+                return;
+            }
+
+            console.info(`Trickplay Preview: no answer for ${Math.round(elapsed)}ms, retrying`);
+        }
+
+        // The hovered frame wins over any queued background work.
+        this.prefetchQueue = [];
+
+        // The worker only keeps the latest request alive, so the ones it
+        // dropped will never be answered.
         for (const pendingKey of Array.from(this.pending.keys())) {
             this.clearPending(pendingKey);
         }
 
         this.lastRequestedKey = key;
+        this.inFlight = { itemKey: info.cacheKey, key, startedAt: performance.now() };
+        this.dispatchThumbnail(info, bucket, key);
+    }
 
+    dispatchThumbnail(info, bucket, key) {
         const timer = window.setTimeout(() => {
             this.pending.delete(key);
+            if (this.inFlight?.key === key) {
+                this.inFlight = null;
+                this.requestHoveredThumbnail();
+            }
+            this.pumpPrefetch();
         }, REQUEST_TIMEOUT_MS);
         this.pending.set(key, timer);
 
@@ -328,37 +537,139 @@ class trickplayPlugin {
             console.error('Trickplay Preview: request failed', error);
             window.clearTimeout(timer);
             this.pending.delete(key);
+            if (this.inFlight?.key === key) {
+                this.inFlight = null;
+            }
         }
+    }
+
+    requestHoveredThumbnail() {
+        const hover = this.hover;
+        if (!hover || this.cache.has(hover.key)) {
+            return;
+        }
+
+        if (this.inFlight?.key === hover.key) {
+            return;
+        }
+
+        this.requestThumbnail(hover.info, splitKey(hover.key).bucket, hover.key, false);
     }
 
     onThumbnailReady(cacheKey, dataUrl, width, height) {
         this.clearPending(cacheKey);
+        this.dropSupersededRequest(cacheKey);
 
-        const thumbnail = { dataUrl, width, height };
-        this.cache.set(cacheKey, thumbnail);
+        this.storeThumbnail(cacheKey, { dataUrl, width, height });
 
-        while (this.cache.size > CACHE_LIMIT) {
-            const oldestKey = this.cache.keys().next().value;
-            this.cache.delete(oldestKey);
-        }
+        const { itemKey, bucket } = splitKey(cacheKey);
+        this.lastFrame = { itemKey, thumbnail: this.cache.get(cacheKey) };
 
         const hover = this.hover;
-        if (!hover || hover.key !== cacheKey) {
+        if (hover && hover.key === cacheKey) {
+            this.refreshBubble();
+
+            // The pointer stopped here, so warm up the frames around it.
+            this.schedulePrefetch(hover.info, bucket);
             return;
         }
 
-        const { bubble, info, positionMs, slider } = hover;
-        if (!bubble.isConnected || bubble.classList.contains('hide')) {
-            return;
-        }
+        // The pointer moved on while this frame was generated: show it anyway
+        // and ask for the frame under the pointer.
+        this.refreshBubble();
+        this.requestHoveredThumbnail();
+        this.pumpPrefetch();
+    }
 
-        this.renderThumbnail(slider, bubble, info, positionMs, thumbnail);
+    dropSupersededRequest() {
+        // The worker answers one request at a time and silently drops what it
+        // superseded. Whatever arrives, the request we were waiting for is
+        // either answered or obsolete, so it must not hold the pipeline back.
+        this.inFlight = null;
     }
 
     onThumbnailFailed(cacheKey) {
         this.clearPending(cacheKey);
+        this.dropSupersededRequest(cacheKey);
         if (this.lastRequestedKey === cacheKey) {
             this.lastRequestedKey = null;
+        }
+        this.requestHoveredThumbnail();
+        this.pumpPrefetch();
+    }
+
+    stopPreviewing(bubble) {
+        // Let the standard tooltip come back and stop any background work.
+        this.resetBubbleStyles(bubble || this.hover?.bubble);
+        this.hover = null;
+        this.prefetchQueue = [];
+        this.cancelPrefetchTimer();
+        this.inFlight = null;
+        this.lastRequestedKey = null;
+
+        for (const pendingKey of Array.from(this.pending.keys())) {
+            this.clearPending(pendingKey);
+        }
+    }
+
+    resetBubbleStyles(bubble) {
+        if (!bubble) {
+            return;
+        }
+
+        // The preview styles are inline, so they have to be dropped again or
+        // the client's own tooltip would render without its background.
+        bubble.style.background = '';
+        bubble.style.padding = '';
+        bubble.style.borderRadius = '';
+        bubble.style.boxShadow = '';
+        bubble.style.overflow = '';
+    }
+
+    lastFrameThumbnail(info) {
+        return this.lastFrame?.itemKey === info.cacheKey ? this.lastFrame.thumbnail : null;
+    }
+
+    refreshBubble() {
+        const hover = this.hover;
+        if (!hover) {
+            return;
+        }
+
+        const { bubble, info, positionMs, slider, key } = hover;
+        if (!bubble.isConnected || bubble.classList.contains('hide')) {
+            return;
+        }
+
+        const thumbnail = this.cache.get(key)
+            || this.findNearby(info, splitKey(key).bucket)
+            || this.lastFrameThumbnail(info);
+
+        if (thumbnail) {
+            this.renderThumbnail(slider, bubble, info, positionMs, thumbnail);
+        }
+    }
+
+    storeThumbnail(key, thumbnail) {
+        const { itemKey, bucket } = splitKey(key);
+        this.cache.set(key, thumbnail);
+
+        let buckets = this.bucketsByItem.get(itemKey);
+        if (!buckets) {
+            buckets = new Map();
+            this.bucketsByItem.set(itemKey, buckets);
+        }
+        buckets.set(bucket, key);
+
+        while (this.cache.size > CACHE_LIMIT) {
+            const oldestKey = this.cache.keys().next().value;
+            this.cache.delete(oldestKey);
+
+            const oldest = splitKey(oldestKey);
+            const itemBuckets = this.bucketsByItem.get(oldest.itemKey);
+            if (itemBuckets && itemBuckets.get(oldest.bucket) === oldestKey) {
+                itemBuckets.delete(oldest.bucket);
+            }
         }
     }
 

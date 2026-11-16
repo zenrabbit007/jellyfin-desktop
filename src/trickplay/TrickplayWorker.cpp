@@ -15,7 +15,7 @@ namespace {
 constexpr int kLoadTimeoutMs = 30000;
 constexpr int kSeekTimeoutMs = 15000;
 constexpr int kSettleTimeoutMs = 1000;
-constexpr int kCacheEntries = 300;
+constexpr int kCacheEntries = 500;
 
 QString mpvErrorString(int error)
 {
@@ -180,6 +180,19 @@ bool TrickplayWorker::initializeMpv(QString& error)
   mpv_set_option_string(mpv, "sub-auto", "no");
   mpv_set_option_string(mpv, "hwdec", "no");
   mpv_set_option_string(mpv, "demuxer-mkv-probe-start-time", "no");
+
+  // Previews share the connection with playback, so they must not read ahead:
+  // with the demuxer cache enabled every seek pulls a large chunk of the file
+  // off the server again and the real player starts to stall.
+  mpv_set_option_string(mpv, "cache", "no");
+  mpv_set_option_string(mpv, "demuxer-readahead-secs", "1");
+  mpv_set_option_string(mpv, "demuxer-max-bytes", "4MiB");
+  mpv_set_option_string(mpv, "demuxer-max-back-bytes", "1MiB");
+
+  // A 400px thumbnail does not need the full decoder: keep the preview cheap
+  // so it cannot starve the player of CPU while it decodes.
+  mpv_set_option_string(mpv, "vd-lavc-threads", "2");
+  mpv_set_option_string(mpv, "vd-lavc-skiploopfilter", "all");
   mpv_set_option_string(mpv, "msg-level", "all=error");
   if (!m_userAgent.isEmpty())
     mpv_set_option_string(mpv, "user-agent", m_userAgent.toUtf8().constData());

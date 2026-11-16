@@ -339,6 +339,12 @@
         "platforms_excluded": "oe_rpi"
       },
       {
+        "value": "trickplay_preview",
+        "display_name": "Seek Bar Previews",
+        "help": "Shows a frame of the video in the seek bar tooltip while hovering or dragging it. The frames are generated on the fly from the stream that is playing, so no server-side trickplay task is needed. Disable this if the previews are slow or cause playback problems.",
+        "default": true
+      },
+      {
         "value": "prefer_transcode_to_h265",
         "display_name": "Prefer Transcode to H.265",
         "default": false
