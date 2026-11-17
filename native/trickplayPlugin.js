@@ -1,8 +1,9 @@
 (function() {
-// Replaces the server-generated trickplay images in the video OSD with frames
-// that are extracted on demand from the stream by the native player. While the
-// setting is enabled the native frames are always used, even for items that the
-// Jellyfin trickplay scheduled task already processed.
+// Replaces the trickplay images in the video OSD with frames that are extracted
+// on demand from the stream by the native player. This is the fallback: when
+// the server already knows the trickplay layout of an item, its tiles are used
+// instead -- one tile download covers a whole window of the timeline, while
+// every native frame costs a seek of the video stream.
 const REQUEST_WIDTH = 400;
 const BUBBLE_MAX_WIDTH = 320;
 const BUBBLE_MAX_HEIGHT = 220;
@@ -13,6 +14,9 @@ const CACHE_LIMIT = 500;
 const NEARBY_BUCKETS = 3;
 const PREFETCH_FRAMES = 2;
 const PREFETCH_DELAY_MS = 350;
+// Sweeping the seek bar crosses many buckets. Waiting for the pointer to slow
+// down turns that into one or two seeks instead of one per bucket.
+const HOVER_REQUEST_DELAY_MS = 120;
 // The worker answers every request it receives, but a lost answer must not block
 // previews for good. This has to stay above the worker's own load + seek budget
 // (30s + 15s), otherwise big/slow files get superseded while they are still
@@ -37,6 +41,51 @@ function isPreviewEnabled() {
     // Client Settings > Video > Seek Bar Previews. Missing settings (older
     // configs) keep the feature on.
     return window.jmpInfo?.settings?.video?.trickplay_preview !== false;
+}
+
+function preferServerTrickplay() {
+    const settings = window.jmpInfo?.settings?.video;
+    if (settings?.prefer_server_trickplay === false) {
+        return false;
+    }
+
+    // Never trade a working local preview for a broken tile set.
+    return isPreviewEnabled();
+}
+
+function previewTranscoded() {
+    // Seeking an HLS stream pulls whole segments, lands on the wrong frame and
+    // cannot be cancelled cheaply, so previews stay off unless asked for.
+    return window.jmpInfo?.settings?.video?.['debug.preview_transcoded'] === true;
+}
+
+function isHlsPlayback(state, url) {
+    const playlist = /\.m3u8(\?|$)/i;
+    if (playlist.test(String(url))) {
+        return true;
+    }
+
+    const transcodingUrl = state?.MediaSource?.TranscodingUrl;
+    return typeof transcodingUrl === 'string' && playlist.test(transcodingUrl);
+}
+
+function hasUsableTrickplay(manifest, mediaSourceId) {
+    if (!manifest || typeof manifest !== 'object') {
+        return false;
+    }
+
+    const resolutions = manifest[mediaSourceId];
+    if (!resolutions || typeof resolutions !== 'object') {
+        return false;
+    }
+
+    return Object.values(resolutions).some((info) => Boolean(info)
+        && info.Width > 0
+        && info.Height > 0
+        && info.TileWidth > 0
+        && info.TileHeight > 0
+        && info.Interval > 0
+        && info.ThumbnailCount > 0);
 }
 
 function splitKey(key) {
@@ -88,6 +137,7 @@ class trickplayPlugin {
         this.lastBucket = null;
         this.inFlight = null;
         this.prefetchTimer = undefined;
+        this.hoverTimer = undefined;
         this.warnedNoInfo = false;
         this.loggedFailures = new Set();
         this.loggedItem = null;
@@ -104,6 +154,8 @@ class trickplayPlugin {
         this.patchScheduled = false;
         this.patchCount = 0;
         this.loggedHookItem = null;
+        this.loggedServerItem = null;
+        this.loggedServerUnused = null;
         this.loggedDisabled = false;
         this.loggedBadValue = false;
 
@@ -297,6 +349,11 @@ class trickplayPlugin {
             return null;
         }
 
+        if (!previewTranscoded() && isHlsPlayback(state, url)) {
+            this.noPreviewReason = 'transcoded playback';
+            return null;
+        }
+
         this.noPreviewReason = null;
 
         const mediaSourceId = state.MediaSource?.Id || item.Id;
@@ -308,6 +365,7 @@ class trickplayPlugin {
         return {
             item,
             url,
+            mediaSourceId,
             interval,
             durationMs,
             cacheKey: (item.ServerId || '') + '|' + item.Id + '|' + mediaSourceId
@@ -342,6 +400,22 @@ class trickplayPlugin {
         }
 
         this.warnedNoInfo = false;
+
+        if (this.useServerFrames(info, bubble)) {
+            // The client's own handler already rendered the server tile before
+            // calling us. Claim the bubble -- returning false would make the
+            // slider replace the tile with its plain time text.
+            if (this.hover || this.prefetchQueue.length || this.hoverTimer !== undefined) {
+                this.stopPreviewing(bubble);
+            }
+
+            if (this.loggedServerItem !== info.cacheKey) {
+                this.loggedServerItem = info.cacheKey;
+                console.info('Trickplay Preview: using the server trickplay tiles for item ' + info.item.Id);
+            }
+
+            return true;
+        }
 
         if (this.loggedHookItem !== info.cacheKey) {
             this.loggedHookItem = info.cacheKey;
@@ -390,8 +464,48 @@ class trickplayPlugin {
             this.renderDefaultBubble(slider, bubble, value, positionMs);
         }
 
-        this.requestThumbnail(info, bucket, key, false);
+        this.scheduleHoverRequest(info, bucket, key);
         return true;
+    }
+
+    useServerFrames(info, bubble) {
+        if (!preferServerTrickplay() || !hasUsableTrickplay(info.item?.Trickplay, info.mediaSourceId)) {
+            return false;
+        }
+
+        // The client rendered its own bubble before calling us, so stay out of
+        // the way only when it actually put a trickplay tile in there.
+        const tile = bubble?.querySelector?.('.chapterThumbWrapper');
+        const rendered = Boolean(tile && String(tile.style.backgroundImage).includes('/Trickplay/'));
+
+        if (!rendered && this.loggedServerUnused !== info.cacheKey) {
+            this.loggedServerUnused = info.cacheKey;
+            console.info('Trickplay Preview: the server has trickplay tiles for this item but the client did not render one, using native frames');
+        }
+
+        return rendered;
+    }
+
+    scheduleHoverRequest(info, bucket, key) {
+        this.cancelHoverRequest();
+        this.hoverTimer = window.setTimeout(() => {
+            this.hoverTimer = undefined;
+
+            // A sweep of the seek bar crosses bucket after bucket; only the
+            // position the pointer came to rest on is worth a seek.
+            if (!this.hover || this.hover.key !== key) {
+                return;
+            }
+
+            this.requestThumbnail(info, bucket, key, false);
+        }, HOVER_REQUEST_DELAY_MS);
+    }
+
+    cancelHoverRequest() {
+        if (this.hoverTimer !== undefined) {
+            window.clearTimeout(this.hoverTimer);
+            this.hoverTimer = undefined;
+        }
     }
 
     logHover(bucket, source) {
@@ -729,6 +843,7 @@ class trickplayPlugin {
         this.hover = null;
         this.prefetchQueue = [];
         this.cancelPrefetchTimer();
+        this.cancelHoverRequest();
         this.inFlight = null;
         this.lastRequestedKey = null;
 
