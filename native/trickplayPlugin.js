@@ -25,6 +25,9 @@ const FRAME_HOVER_DELAY_MS = 120;
 // A position without a frame (the very end of a file, or a file the server
 // cannot read right now) must not disable the endpoint for the whole item.
 const FRAME_FAILURES_BEFORE_FALLBACK = 3;
+// Assigning another source aborts a running image download. The blank image is
+// used instead of an empty string, which would resolve to the page itself.
+const BLANK_IMAGE = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 // The worker answers every request it receives, but a lost answer must not block
 // previews for good. This has to stay above the worker's own load + seek budget
 // (30s + 15s), otherwise big/slow files get superseded while they are still
@@ -212,6 +215,7 @@ class trickplayPlugin {
         this.loggedDisabled = false;
         this.loggedBadValue = false;
         this.frameTimer = undefined;
+        this.frameRequest = null;
         this.frameCache = new Set();
         this.frameFailedUrls = new Set();
         this.frameFailures = new Map();
@@ -570,6 +574,12 @@ class trickplayPlugin {
             return false;
         }
 
+        // The pointer left the position this request was for, so stop it before
+        // the server spends a process on a frame nobody is waiting for.
+        if (this.frameRequest && this.frameRequest.url !== url) {
+            this.cancelFrameRequest();
+        }
+
         const key = info.cacheKey + '|frame|' + bucket;
 
         if (this.hover?.frame !== true || this.hover.info.cacheKey !== info.cacheKey) {
@@ -578,7 +588,7 @@ class trickplayPlugin {
             this.stopPreviewing(bubble);
         }
 
-        this.hover = { bubble, info, slider, positionMs, key, frame: true };
+        this.hover = { bubble, info, slider, positionMs, key, url, frame: true };
 
         if (this.loggedFrameItem !== info.cacheKey) {
             this.loggedFrameItem = info.cacheKey;
@@ -641,13 +651,25 @@ class trickplayPlugin {
         // of seconds. Putting the image in the bubble right away would show an
         // empty frame for that long, so it is decoded first and swapped in when
         // it is ready; the tooltip stays visible until then.
-        const hover = this.hover;
-        const image = new Image();
-
-        image.addEventListener('load', () => {
-            if (this.hover !== hover || !bubble.isConnected) {
+        if (this.frameRequest) {
+            if (this.frameRequest.url === url) {
+                // Already on its way; its answer paints whatever is hovered by then.
                 return;
             }
+
+            this.cancelFrameRequest();
+        }
+
+        const image = new Image();
+        const request = { image, url };
+        this.frameRequest = request;
+
+        image.addEventListener('load', () => {
+            if (this.frameRequest !== request) {
+                return;
+            }
+
+            this.frameRequest = null;
 
             if (this.frameCache.size > 1000) {
                 this.frameCache.clear();
@@ -655,7 +677,12 @@ class trickplayPlugin {
             this.frameCache.add(url);
             this.frameFailures.delete(info.cacheKey);
 
-            this.renderThumbnail(slider, bubble, info, positionMs, {
+            const hover = this.hover;
+            if (!hover || hover.frame !== true || hover.url !== url || !hover.bubble.isConnected) {
+                return;
+            }
+
+            this.renderThumbnail(hover.slider, hover.bubble, hover.info, hover.positionMs, {
                 src: url,
                 width: frameInfo.Width,
                 height: frameInfo.Height
@@ -663,14 +690,31 @@ class trickplayPlugin {
         }, { once: true });
 
         image.addEventListener('error', () => {
-            if (this.hover !== hover) {
+            if (this.frameRequest !== request) {
                 return;
             }
 
-            this.onServerFrameFailed(info, slider, bubble, positionMs, url);
+            this.frameRequest = null;
+
+            const hover = this.hover;
+            if (!hover || hover.url !== url) {
+                return;
+            }
+
+            this.onServerFrameFailed(info, hover.slider, hover.bubble, hover.positionMs, url);
         }, { once: true });
 
         image.src = url;
+    }
+
+    cancelFrameRequest() {
+        const request = this.frameRequest;
+        if (!request) {
+            return;
+        }
+
+        this.frameRequest = null;
+        request.image.src = BLANK_IMAGE;
     }
 
     onServerFrameFailed(info, slider, bubble, positionMs, url) {
@@ -1083,6 +1127,7 @@ class trickplayPlugin {
         this.cancelPrefetchTimer();
         this.cancelHoverRequest();
         this.cancelFrameTimer();
+        this.cancelFrameRequest();
         this.inFlight = null;
         this.lastRequestedKey = null;
 
