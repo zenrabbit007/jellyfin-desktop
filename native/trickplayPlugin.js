@@ -14,11 +14,12 @@ const CACHE_LIMIT = 500;
 const NEARBY_BUCKETS = 3;
 const PREFETCH_FRAMES = 2;
 const PREFETCH_DELAY_MS = 350;
-// Sweeping the seek bar crosses many buckets. Waiting for the pointer to slow
-// down turns that into one or two seeks instead of one per bucket.
+// Sweeping the seek bar crosses many buckets. Requests are throttled to this
+// interval and only one is in flight at a time, so the preview follows the
+// pointer without asking for every bucket it crosses.
 const HOVER_REQUEST_DELAY_MS = 120;
-// A 4K frame costs a GOP of reading and decoding, so a sweep that would cross it
-// is worth waiting out for longer than on a 1080p stream.
+// A 4K frame costs a GOP of reading and decoding, so the preview follows the
+// pointer more slowly there than on a 1080p stream.
 const HEAVY_HOVER_REQUEST_DELAY_MS = 260;
 // The keyframe frame is already on screen, so the exact one is only worth its
 // own seek once the pointer has settled on the position.
@@ -617,13 +618,25 @@ class trickplayPlugin {
     }
 
     scheduleHoverRequest(info, bucket, key) {
-        this.cancelHoverRequest();
+        // The preview follows the pointer instead of waiting for it to stop:
+        // the timer is not pushed back on every move, so a request goes out at
+        // this interval for wherever the pointer is by then. One request is in
+        // flight at a time, which keeps a fast sweep from queueing seeks.
+        if (this.hoverTimer !== undefined) {
+            return;
+        }
+
         this.hoverTimer = window.setTimeout(() => {
             this.hoverTimer = undefined;
 
-            // A sweep of the seek bar crosses bucket after bucket; only the
-            // position the pointer came to rest on is worth a seek.
-            if (!this.hover || this.hover.key !== key) {
+            if (!this.hover) {
+                return;
+            }
+
+            // The pointer moved on while the timer was running: preview where
+            // it is now instead of where it was.
+            if (this.hover.key !== key) {
+                this.requestHoveredThumbnail();
                 return;
             }
 
