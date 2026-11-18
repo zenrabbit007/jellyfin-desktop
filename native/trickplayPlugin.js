@@ -23,9 +23,6 @@ const HOVER_REQUEST_DELAY_MS = 120;
 // being read and never produce a frame.
 const IN_FLIGHT_TIMEOUT_MS = 50000;
 const REQUEST_TIMEOUT_MS = 60000;
-// Opening the stream before the first hover saves a load on every preview.
-// Waiting lets the player buffer first, so both do not compete for the link.
-const PREPARE_DELAY_MS = 2000;
 
 function debugEnabled() {
     return window.jmpInfo?.settings?.video?.['debug.trickplay_timings'] === true;
@@ -162,7 +159,6 @@ class trickplayPlugin {
         this.patchCount = 0;
         this.lastItemKey = null;
         this.preparedKey = null;
-        this.prepareCandidate = null;
         this.loggedHookItem = null;
         this.loggedServerItem = null;
         this.loggedServerUnused = null;
@@ -397,30 +393,14 @@ class trickplayPlugin {
         }
 
         const info = this.getPlaybackInfo();
-        if (!info) {
-            this.prepareCandidate = null;
+        if (!info || this.preparedKey === info.cacheKey) {
             return;
         }
 
-        if (this.preparedKey === info.cacheKey) {
-            this.prepareCandidate = null;
-            return;
-        }
-
-        // Only open the stream once the same item has been playing for a
-        // moment, so the preview never competes with the initial buffering.
-        const now = performance.now();
-        if (this.prepareCandidate?.cacheKey !== info.cacheKey) {
-            this.prepareCandidate = { cacheKey: info.cacheKey, url: info.url, since: now };
-            return;
-        }
-
-        if (now - this.prepareCandidate.since < PREPARE_DELAY_MS) {
-            return;
-        }
-
+        // Opening the stream costs a connection and a header read, so it only
+        // happens once the player has a source of its own. After that the first
+        // hover only pays for a seek.
         this.preparedKey = info.cacheKey;
-        this.prepareCandidate = null;
         this.debug('Trickplay Preview: opened the stream ahead of the first hover');
 
         try {
