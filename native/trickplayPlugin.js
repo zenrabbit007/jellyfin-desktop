@@ -22,6 +22,9 @@ const HOVER_REQUEST_DELAY_MS = 120;
 // Same reasoning for the server frames: a sweep across the bar would otherwise
 // ask the server to extract a frame for every bucket it passes.
 const FRAME_HOVER_DELAY_MS = 120;
+// A position without a frame (the very end of a file, or a file the server
+// cannot read right now) must not disable the endpoint for the whole item.
+const FRAME_FAILURES_BEFORE_FALLBACK = 3;
 // The worker answers every request it receives, but a lost answer must not block
 // previews for good. This has to stay above the worker's own load + seek budget
 // (30s + 15s), otherwise big/slow files get superseded while they are still
@@ -210,6 +213,8 @@ class trickplayPlugin {
         this.loggedBadValue = false;
         this.frameTimer = undefined;
         this.frameCache = new Set();
+        this.frameFailedUrls = new Set();
+        this.frameFailures = new Map();
         this.frameUnsupported = new Set();
         this.loggedFrameItem = null;
 
@@ -561,7 +566,7 @@ class trickplayPlugin {
         // one interval re-uses the image the browser already has.
         const bucket = Math.floor(positionMs / frameInfo.Interval) * frameInfo.Interval;
         const url = this.buildFrameUrl(api, info, frameInfo, bucket);
-        if (!url) {
+        if (!url || this.frameFailedUrls.has(url)) {
             return false;
         }
 
@@ -648,6 +653,7 @@ class trickplayPlugin {
                 this.frameCache.clear();
             }
             this.frameCache.add(url);
+            this.frameFailures.delete(info.cacheKey);
 
             this.renderThumbnail(slider, bubble, info, positionMs, {
                 src: url,
@@ -661,20 +667,33 @@ class trickplayPlugin {
                 return;
             }
 
-            this.onServerFrameFailed(info, slider, bubble, positionMs);
+            this.onServerFrameFailed(info, slider, bubble, positionMs, url);
         }, { once: true });
 
         image.src = url;
     }
 
-    onServerFrameFailed(info, slider, bubble, positionMs) {
+    onServerFrameFailed(info, slider, bubble, positionMs, url) {
+        if (this.frameFailedUrls.size > 2000) {
+            this.frameFailedUrls.clear();
+        }
+        this.frameFailedUrls.add(url);
+
         // The server is either too old for this endpoint or has the on demand
-        // frame extraction turned off: stop asking for this item and let the
-        // tiles or the native preview handle it.
-        this.frameUnsupported.add(info.cacheKey);
+        // frame extraction turned off. Only stop asking for the item once a few
+        // positions failed, a single position can be missing on its own.
+        const failures = (this.frameFailures.get(info.cacheKey) || 0) + 1;
+        this.frameFailures.set(info.cacheKey, failures);
+
+        if (failures >= FRAME_FAILURES_BEFORE_FALLBACK) {
+            this.frameUnsupported.add(info.cacheKey);
+            console.info('Trickplay Preview: the server returned no frames, falling back');
+        } else {
+            console.info('Trickplay Preview: no frame for this position, falling back');
+        }
+
         this.hover = null;
         this.resetBubbleStyles(bubble);
-        console.info('Trickplay Preview: the server returned no frame, falling back');
 
         const value = info.durationMs > 0 ? positionMs / info.durationMs * 100 : 0;
         this.onSliderBubbleUpdate(slider, bubble, value);
