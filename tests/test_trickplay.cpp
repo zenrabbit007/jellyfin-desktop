@@ -101,6 +101,9 @@ void TestTrickplay::testGeneratesFrameAtRequestedPosition()
   QCOMPARE(args.at(3).toInt(), 160);
   QCOMPARE(args.at(4).toInt(), 90);
 
+  // The frame is at the requested position, and says so.
+  QCOMPARE(args.at(6).toLongLong(), 500LL);
+
   const QByteArray jpeg = QByteArray::fromBase64(dataUrl.mid(prefix.size()).toLatin1());
   QImage image;
   QVERIFY(image.loadFromData(jpeg, "JPEG"));
@@ -247,6 +250,11 @@ void TestTrickplay::testKeyframeFrameArrivesFirst()
   const QImage exact = decodeThumbnail(readySpy.at(1).at(2).toString());
   QCOMPARE(fast.size(), QSize(160, 90));
   QCOMPARE(exact.size(), QSize(160, 90));
+
+  // The preview labels the frame with its own time, so the keyframe frame must
+  // report the keyframe it was taken from and not the position asked for.
+  QCOMPARE(readySpy.at(0).at(6).toLongLong(), 2000LL);
+  QCOMPARE(readySpy.at(1).at(6).toLongLong(), 2500LL);
 }
 
 void TestTrickplay::testSpeculativeRequestStopsAtTheKeyframe()
@@ -268,6 +276,9 @@ void TestTrickplay::testSpeculativeRequestStopsAtTheKeyframe()
   QCOMPARE(readySpy.count(), 1);
   QCOMPARE(readySpy.at(0).at(5).toBool(), false);
 
+  // A speculative frame knows where it came from as well.
+  QCOMPARE(readySpy.at(0).at(6).toLongLong(), 2000LL);
+
   // Asking again for that key finishes it.
   worker.setLatestRequest(2);
   worker.generate(2, media, 2500, 160, QStringLiteral("speculative|1"), true);
@@ -276,6 +287,7 @@ void TestTrickplay::testSpeculativeRequestStopsAtTheKeyframe()
   const QList<QVariant> exact = frameAtRequestedPosition(readySpy);
   QVERIFY(!exact.isEmpty());
   QVERIFY(exact.at(2).toString() != readySpy.at(0).at(2).toString());
+  QCOMPARE(exact.at(6).toLongLong(), 2500LL);
 }
 
 void TestTrickplay::testBrokenStreamIsRememberedPerUrl()

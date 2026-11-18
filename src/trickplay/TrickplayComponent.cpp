@@ -106,12 +106,13 @@ void TrickplayComponent::prepare(const QString& url)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-void TrickplayComponent::onReady(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height, bool finalFrame)
+void TrickplayComponent::onReady(quint64 id, const QString& cacheKey, const QString& dataUrl, int width,
+                                 int height, bool finalFrame, qint64 framePositionMs)
 {
   if (id != m_latestRequestId)
     return;
 
-  emit thumbnailReady(cacheKey, dataUrl, width, height, finalFrame);
+  emit thumbnailReady(cacheKey, dataUrl, width, height, finalFrame, framePositionMs);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

@@ -34,6 +34,8 @@ public:
   /// arrive twice for one request: first with the frame at the keyframe before
   /// positionMs, then with the frame at positionMs itself. refine=false asks
   /// for the first of the two only, which is enough for a speculative frame.
+  /// thumbnailReady() reports where the frame was really taken, which can be
+  /// before positionMs when a seek lands on the previous keyframe.
   Q_INVOKABLE void requestThumbnail(const QString& url, qint64 positionMs, int width,
                                     const QString& cacheKey, bool refine);
 
@@ -43,12 +45,13 @@ public:
 
 Q_SIGNALS:
   void thumbnailReady(const QString& cacheKey, const QString& dataUrl, int width, int height,
-                      bool finalFrame);
+                      bool finalFrame, qint64 framePositionMs);
   void thumbnailFailed(const QString& cacheKey, const QString& error);
 
 private:
   void ensureWorker();
-  void onReady(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height, bool finalFrame);
+  void onReady(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height,
+               bool finalFrame, qint64 framePositionMs);
   void onFailed(quint64 id, const QString& cacheKey, const QString& error);
 
   QThread* m_thread = nullptr;

@@ -49,9 +49,12 @@ public Q_SLOTS:
 Q_SIGNALS:
   /// finalFrame is false for the frame at the keyframe before the requested
   /// position, which is delivered first so a preview appears within ~50ms, and
-  /// true for the frame at the requested position.
+  /// true for the frame at the requested position. framePositionMs is where the
+  /// frame was really taken: a keyframe seek lands up to one keyframe interval
+  /// before the position that was asked for, and the caller labels the preview
+  /// with the frame's time so the image and the label agree.
   void ready(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height,
-             bool finalFrame);
+             bool finalFrame, qint64 framePositionMs);
   void failed(quint64 id, const QString& cacheKey, const QString& error);
 
 private:
@@ -62,6 +65,7 @@ private:
     QByteArray jpeg;
     int width = 0;
     int height = 0;
+    qint64 positionMs = 0;
     bool finalFrame = false;
   };
 
@@ -81,7 +85,7 @@ private:
   bool applyScale(int width);
   bool isCancelled(quint64 id) const;
   void deliver(quint64 id, const QString& cacheKey, const QByteArray& jpeg, int width, int height,
-               bool finalFrame);
+               bool finalFrame, qint64 framePositionMs);
   static QString dataUrl(const QByteArray& jpeg);
   void drainEvents();
   void cleanupFiles();

@@ -211,8 +211,8 @@ class trickplayPlugin {
             return;
         }
 
-        this.api.trickplay.thumbnailReady.connect((cacheKey, dataUrl, width, height, finalFrame) => {
-            this.onThumbnailReady(cacheKey, dataUrl, width, height, finalFrame);
+        this.api.trickplay.thumbnailReady.connect((cacheKey, dataUrl, width, height, finalFrame, framePositionMs) => {
+            this.onThumbnailReady(cacheKey, dataUrl, width, height, finalFrame, framePositionMs);
         });
         this.api.trickplay.thumbnailFailed.connect((cacheKey, reason) => {
             this.onThumbnailFailed(cacheKey, reason);
@@ -663,7 +663,11 @@ class trickplayPlugin {
             image.style.height = height + 'px';
         }
 
-        const label = formatTime(positionMs);
+        // The bubble sits under the pointer, but the time in it belongs to the
+        // image: one frame covers a whole bucket, and a keyframe frame can be
+        // older still. A label that disagrees with the picture reads as a
+        // preview of the wrong part of the video.
+        const label = formatTime(thumbnail.positionMs ?? positionMs);
         if (time.textContent !== label) {
             time.textContent = label;
         }
@@ -887,10 +891,10 @@ class trickplayPlugin {
         this.requestThumbnail(hover.info, splitKey(hover.key).bucket, hover.key, false);
     }
 
-    onThumbnailReady(cacheKey, dataUrl, width, height, finalFrame) {
+    onThumbnailReady(cacheKey, dataUrl, width, height, finalFrame, framePositionMs) {
         const final = finalFrame !== false;
 
-        this.storeThumbnail(cacheKey, { dataUrl, width, height, final });
+        this.storeThumbnail(cacheKey, { dataUrl, width, height, final, positionMs: framePositionMs });
 
         const { itemKey, bucket } = splitKey(cacheKey);
         this.lastFrame = { itemKey, thumbnail: this.cache.get(cacheKey) };

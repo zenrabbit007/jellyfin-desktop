@@ -30,6 +30,13 @@ constexpr int kCacheEntries = 500;
 // exact seek afterwards, so a preview always ends up on the requested frame.
 constexpr qint64 kRefineToleranceMs = 100;
 
+// Where the captured frame was really taken. A seek can land on an earlier
+// keyframe, and the preview label has to follow the image.
+qint64 frameTimeMs(double positionMs, qint64 fallbackMs)
+{
+  return positionMs >= 0 ? qRound64(positionMs) : fallbackMs;
+}
+
 QString mpvErrorString(int error)
 {
   const char* str = mpv_error_string(error);
@@ -499,16 +506,17 @@ QString TrickplayWorker::dataUrl(const QByteArray& jpeg)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 void TrickplayWorker::deliver(quint64 id, const QString& cacheKey, const QByteArray& jpeg, int width,
-                              int height, bool finalFrame)
+                              int height, bool finalFrame, qint64 framePositionMs)
 {
   Thumbnail* thumbnail = new Thumbnail;
   thumbnail->jpeg = jpeg;
   thumbnail->width = width;
   thumbnail->height = height;
+  thumbnail->positionMs = framePositionMs;
   thumbnail->finalFrame = finalFrame;
   m_cache.insert(cacheKey, thumbnail);
 
-  emit ready(id, cacheKey, dataUrl(jpeg), width, height, finalFrame);
+  emit ready(id, cacheKey, dataUrl(jpeg), width, height, finalFrame, framePositionMs);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -542,13 +550,15 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
 
   if (const Thumbnail* cached = m_cache.object(cacheKey)) {
     if (cached->finalFrame) {
-      emit ready(id, cacheKey, dataUrl(cached->jpeg), cached->width, cached->height, true);
+      emit ready(id, cacheKey, dataUrl(cached->jpeg), cached->width, cached->height, true,
+                 cached->positionMs);
       return;
     }
 
     // The cheap frame is all a background request asked for, and it is here.
     if (!refine) {
-      emit ready(id, cacheKey, dataUrl(cached->jpeg), cached->width, cached->height, false);
+      emit ready(id, cacheKey, dataUrl(cached->jpeg), cached->width, cached->height, false,
+                 cached->positionMs);
       return;
     }
   }
@@ -606,6 +616,7 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
 
   const qint64 keyframeMs = timer.elapsed();
   const double landedMs = currentPositionSeconds() * 1000.0;
+  const qint64 keyframePositionMs = frameTimeMs(landedMs, positionMs);
 
   // Keyframe seeking lands on the previous keyframe, which is up to one
   // keyframe interval early. When that is close enough the frame is already
@@ -617,7 +628,7 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
       qDebug() << "Trickplay frame ready at" << positionMs << "ms: load" << loadMs << "ms, keyframe"
                << keyframeMs << "ms, exact (same keyframe)";
     }
-    deliver(id, cacheKey, jpeg, frameWidth, frameHeight, true);
+    deliver(id, cacheKey, jpeg, frameWidth, frameHeight, true, keyframePositionMs);
     return;
   }
 
@@ -626,7 +637,7 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
              << loadMs << "ms, keyframe" << keyframeMs << "ms" << (refine ? "" : ", no refine");
   }
 
-  deliver(id, cacheKey, jpeg, frameWidth, frameHeight, false);
+  deliver(id, cacheKey, jpeg, frameWidth, frameHeight, false, keyframePositionMs);
 
   // A speculative request is answered by the cheap frame; the position it
   // guessed may never be looked at, so decoding up to it would be wasted.
@@ -649,5 +660,6 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
   if (m_logTimings)
     qDebug() << "Trickplay frame refined at" << positionMs << "ms: exact" << timer.elapsed() << "ms";
 
-  deliver(id, cacheKey, jpeg, frameWidth, frameHeight, true);
+  deliver(id, cacheKey, jpeg, frameWidth, frameHeight, true,
+          frameTimeMs(currentPositionSeconds() * 1000.0, positionMs));
 }
