@@ -61,6 +61,40 @@ function setPlaybackActive(active) {
     resetAutoLogoutTimer();
 }
 
+// The web client fades the OSD header and controls out to a translucent grey
+// over the video. Since the native video output fills the window, those scrims
+// read as grey bands above and below the picture, so drop them here and keep
+// the controls legible with their own shadow.
+const OSD_STYLE_ID = 'jmp-osd-style';
+const OSD_STYLE = `
+    .skinHeader-withBackground.osdHeader,
+    .videoOsdBottom {
+        background: none !important;
+    }
+
+    .skinHeader-withBackground.osdHeader,
+    .videoOsdBottom {
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+    }
+`;
+
+function injectOsdStyle() {
+    if (document.getElementById(OSD_STYLE_ID)) {
+        return;
+    }
+
+    const style = document.createElement('style');
+    style.id = OSD_STYLE_ID;
+    style.textContent = OSD_STYLE;
+    (document.head ?? document.documentElement).appendChild(style);
+}
+
+if (document.head) {
+    injectOsdStyle();
+} else {
+    document.addEventListener('DOMContentLoaded', injectOsdStyle, { once: true });
+}
+
 ['keydown', 'pointerdown', 'pointermove', 'wheel'].forEach((eventName) => {
     document.addEventListener(eventName, resetAutoLogoutTimer, { passive: true });
 });
