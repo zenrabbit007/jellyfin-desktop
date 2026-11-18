@@ -463,7 +463,7 @@ class trickplayPlugin {
 
         this.loggedBadValue = false;
 
-        if (this.showServerFrame(info, bubble, slider, positionMs, value)) {
+        if (this.showServerFrame(info, bubble, slider, positionMs)) {
             return true;
         }
 
@@ -546,7 +546,7 @@ class trickplayPlugin {
         return true;
     }
 
-    showServerFrame(info, bubble, slider, positionMs, value) {
+    showServerFrame(info, bubble, slider, positionMs) {
         if (!allowServerImages() || this.frameUnsupported.has(info.cacheKey)) {
             return false;
         }
@@ -580,11 +580,6 @@ class trickplayPlugin {
             console.info('Trickplay Preview: using on demand server frames for item ' + info.item.Id);
         }
 
-        // Never replace a tile the client already rendered with the plain
-        // tooltip, it is a better placeholder than the time text.
-        const clientTile = bubble?.querySelector?.('.chapterThumbWrapper');
-        const showsTile = Boolean(clientTile && String(clientTile.style.backgroundImage).includes('/Trickplay/'));
-
         this.resetBubbleStyles(bubble);
 
         if (this.frameCache.has(url)) {
@@ -592,12 +587,9 @@ class trickplayPlugin {
             return true;
         }
 
-        // Keep the client's tooltip while the pointer moves, and only ask the
-        // server once it settled.
-        if (!showsTile) {
-            this.renderDefaultBubble(slider, bubble, value, positionMs);
-        }
-
+        // Leave whatever the client rendered in the bubble alone -- its tooltip or
+        // a trickplay tile -- while the pointer moves, so the only thing the wait
+        // adds is the frame appearing. Asking the server is left to the settle.
         this.cancelFrameTimer();
         this.frameTimer = window.setTimeout(() => {
             this.frameTimer = undefined;
@@ -640,24 +632,39 @@ class trickplayPlugin {
     }
 
     renderServerFrame(bubble, slider, info, positionMs, url, frameInfo) {
-        this.renderThumbnail(slider, bubble, info, positionMs, {
-            src: url,
-            width: frameInfo.Width,
-            height: frameInfo.Height
-        });
-
-        const image = bubble.querySelector('.jmpTpImage');
-        if (!image) {
-            return;
-        }
+        // The extraction costs the server a fraction of a second up to a couple
+        // of seconds. Putting the image in the bubble right away would show an
+        // empty frame for that long, so it is decoded first and swapped in when
+        // it is ready; the tooltip stays visible until then.
+        const hover = this.hover;
+        const image = new Image();
 
         image.addEventListener('load', () => {
-            if (this.frameCache.size > 2000) {
+            if (this.hover !== hover || !bubble.isConnected) {
+                return;
+            }
+
+            if (this.frameCache.size > 1000) {
                 this.frameCache.clear();
             }
             this.frameCache.add(url);
+
+            this.renderThumbnail(slider, bubble, info, positionMs, {
+                src: url,
+                width: frameInfo.Width,
+                height: frameInfo.Height
+            });
         }, { once: true });
-        image.addEventListener('error', () => this.onServerFrameFailed(info, slider, bubble, positionMs), { once: true });
+
+        image.addEventListener('error', () => {
+            if (this.hover !== hover) {
+                return;
+            }
+
+            this.onServerFrameFailed(info, slider, bubble, positionMs);
+        }, { once: true });
+
+        image.src = url;
     }
 
     onServerFrameFailed(info, slider, bubble, positionMs) {
