@@ -159,6 +159,9 @@ class trickplayPlugin {
         this.patchCount = 0;
         this.lastItemKey = null;
         this.preparedKey = null;
+        this.producedItems = new Set();
+        this.itemFailures = new Map();
+        this.failedItems = new Set();
         this.loggedHookItem = null;
         this.loggedServerItem = null;
         this.loggedServerUnused = null;
@@ -394,6 +397,15 @@ class trickplayPlugin {
 
         const info = this.getPlaybackInfo();
         if (!info || this.preparedKey === info.cacheKey) {
+            return;
+        }
+
+        // Nothing will be requested from the worker when the bubble is filled
+        // from the server's own trickplay images, so opening a second stream
+        // would only hold a connection and a demuxer cache open for nothing.
+        if (preferServerTrickplay() && hasUsableTrickplay(info.item?.Trickplay, info.mediaSourceId)) {
+            this.preparedKey = info.cacheKey;
+            this.debug('Trickplay Preview: server trickplay is available, not opening the stream');
             return;
         }
 
@@ -767,11 +779,17 @@ class trickplayPlugin {
     }
 
     requestThumbnail(info, bucket, key, background) {
+        // A worker that cannot read this item would otherwise be asked again
+        // for every bucket the pointer crosses.
+        if (this.failedItems.has(info.cacheKey)) {
+            return;
+        }
+
         if (background) {
             if (this.cache.has(key) || this.pending.has(key)) {
                 return;
             }
-            this.dispatchThumbnail(info, bucket, key);
+            this.dispatchThumbnail(info, bucket, key, true);
             return;
         }
 
@@ -823,10 +841,10 @@ class trickplayPlugin {
 
         this.lastRequestedKey = key;
         this.inFlight = { itemKey: info.cacheKey, key, startedAt: performance.now() };
-        this.dispatchThumbnail(info, bucket, key);
+        this.dispatchThumbnail(info, bucket, key, false);
     }
 
-    dispatchThumbnail(info, bucket, key) {
+    dispatchThumbnail(info, bucket, key, background) {
         const timer = window.setTimeout(() => {
             this.pending.delete(key);
             if (this.inFlight?.key === key) {
@@ -835,10 +853,12 @@ class trickplayPlugin {
             }
             this.pumpPrefetch();
         }, REQUEST_TIMEOUT_MS);
-        this.pending.set(key, timer);
+        this.pending.set(key, { timer, background });
 
         try {
-            this.api.trickplay.requestThumbnail(info.url, bucket, REQUEST_WIDTH, key);
+            // A background frame is only a guess at where the pointer goes
+            // next, so it is not worth decoding up to that position.
+            this.api.trickplay.requestThumbnail(info.url, bucket, REQUEST_WIDTH, key, !background);
         } catch (error) {
             console.error('Trickplay Preview: request failed', error);
             window.clearTimeout(timer);
@@ -874,11 +894,19 @@ class trickplayPlugin {
 
         const { itemKey, bucket } = splitKey(cacheKey);
         this.lastFrame = { itemKey, thumbnail: this.cache.get(cacheKey) };
+        this.producedItems.add(itemKey);
 
         // The frame at the keyframe before the position arrives first. The
         // exact frame is still being generated, so the request stays pending
         // and the background queue stays paused until it is delivered.
         if (!final) {
+            // A speculative request asked for this frame only, so it is done
+            // and must not hold the queue back.
+            if (this.pending.get(cacheKey)?.background) {
+                this.clearPending(cacheKey);
+                this.pumpPrefetch();
+            }
+
             if (this.hover?.key === cacheKey) {
                 this.refreshBubble();
             }
@@ -930,6 +958,8 @@ class trickplayPlugin {
             this.lastRequestedKey = null;
         }
 
+        this.recordFailure(splitKey(cacheKey).itemKey);
+
         // Only chase the pointer again when the failure was not for the frame
         // under it. Retrying the hovered frame right away would spin on a video
         // the worker cannot read.
@@ -938,6 +968,24 @@ class trickplayPlugin {
         }
 
         this.pumpPrefetch();
+    }
+
+    recordFailure(itemKey) {
+        // A frame that could not be refined is not a broken item: the keyframe
+        // frame is already on screen and later positions may work.
+        if (this.producedItems.has(itemKey)) {
+            return;
+        }
+
+        const failures = (this.itemFailures.get(itemKey) || 0) + 1;
+        this.itemFailures.set(itemKey, failures);
+        if (failures < 2) {
+            return;
+        }
+
+        this.failedItems.add(itemKey);
+        this.debug('Trickplay Preview: giving up on this item, no frame could be read from it');
+        this.stopPreviewing();
     }
 
     stopPreviewing(bubble) {
@@ -1040,9 +1088,9 @@ class trickplayPlugin {
     }
 
     clearPending(cacheKey) {
-        const timer = this.pending.get(cacheKey);
-        if (timer !== undefined) {
-            window.clearTimeout(timer);
+        const request = this.pending.get(cacheKey);
+        if (request) {
+            window.clearTimeout(request.timer);
             this.pending.delete(cacheKey);
         }
     }

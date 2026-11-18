@@ -71,6 +71,8 @@ private slots:
   void testFrameMatchesRequestedPosition();
   void testMissingMediaFails();
   void testKeyframeFrameArrivesFirst();
+  void testSpeculativeRequestStopsAtTheKeyframe();
+  void testBrokenStreamIsRememberedPerUrl();
   void testTempDirStaysPrivate();
   void testComponentDeliversThumbnail();
 };
@@ -85,7 +87,7 @@ void TestTrickplay::testGeneratesFrameAtRequestedPosition()
   QSignalSpy failedSpy(&worker, &TrickplayWorker::failed);
 
   worker.setLatestRequest(1);
-  worker.generate(1, media, 500, 160, QStringLiteral("item|1"));
+  worker.generate(1, media, 500, 160, QStringLiteral("item|1"), true);
 
   QCOMPARE(failedSpy.count(), 0);
   const QList<QVariant> args = frameAtRequestedPosition(readySpy);
@@ -115,13 +117,13 @@ void TestTrickplay::testDifferentPositionsAndCache()
   QSignalSpy failedSpy(&worker, &TrickplayWorker::failed);
 
   worker.setLatestRequest(1);
-  worker.generate(1, media, 500, 160, QStringLiteral("item|first"));
+  worker.generate(1, media, 500, 160, QStringLiteral("item|first"), true);
   QCOMPARE(failedSpy.count(), 0);
   const QString first = frameAtRequestedPosition(readySpy).at(2).toString();
 
   readySpy.clear();
   worker.setLatestRequest(2);
-  worker.generate(2, media, 2500, 160, QStringLiteral("item|second"));
+  worker.generate(2, media, 2500, 160, QStringLiteral("item|second"), true);
   QCOMPARE(failedSpy.count(), 0);
   const QString second = frameAtRequestedPosition(readySpy).at(2).toString();
 
@@ -130,7 +132,7 @@ void TestTrickplay::testDifferentPositionsAndCache()
   // A cached key is answered from memory and yields the exact same frame.
   readySpy.clear();
   worker.setLatestRequest(3);
-  worker.generate(3, media, 500, 160, QStringLiteral("item|first"));
+  worker.generate(3, media, 500, 160, QStringLiteral("item|first"), true);
   QCOMPARE(failedSpy.count(), 0);
   QCOMPARE(readySpy.count(), 1);
   QCOMPARE(readySpy.at(0).at(2).toString(), first);
@@ -149,14 +151,14 @@ void TestTrickplay::testSwitchingMedia()
   QSignalSpy failedSpy(&worker, &TrickplayWorker::failed);
 
   worker.setLatestRequest(1);
-  worker.generate(1, media, 1000, 160, QStringLiteral("first|1"));
+  worker.generate(1, media, 1000, 160, QStringLiteral("first|1"), true);
   QCOMPARE(failedSpy.count(), 0);
   const QImage first = decodeThumbnail(frameAtRequestedPosition(readySpy).at(2).toString());
 
   // Playing another video must reuse the preview player for the new stream.
   readySpy.clear();
   worker.setLatestRequest(2);
-  worker.generate(2, otherMedia, 1000, 160, QStringLiteral("second|1"));
+  worker.generate(2, otherMedia, 1000, 160, QStringLiteral("second|1"), true);
   QCOMPARE(failedSpy.count(), 0);
   const QList<QVariant> secondFrame = frameAtRequestedPosition(readySpy);
   QCOMPARE(secondFrame.at(1).toString(), QStringLiteral("second|1"));
@@ -192,7 +194,8 @@ void TestTrickplay::testFrameMatchesRequestedPosition()
     ++id;
     readySpy.clear();
     worker.setLatestRequest(id);
-    worker.generate(id, media, testCase.positionMs, 160, QStringLiteral("colour|%1").arg(testCase.positionMs));
+    worker.generate(id, media, testCase.positionMs, 160,
+                    QStringLiteral("colour|%1").arg(testCase.positionMs), true);
 
     QCOMPARE(failedSpy.count(), 0);
     const QList<QVariant> args = frameAtRequestedPosition(readySpy);
@@ -214,7 +217,7 @@ void TestTrickplay::testMissingMediaFails()
   timer.start();
 
   worker.setLatestRequest(1);
-  worker.generate(1, QStringLiteral("/nonexistent/trickplay-preview.mp4"), 0, 160, QStringLiteral("missing|1"));
+  worker.generate(1, QStringLiteral("/nonexistent/trickplay-preview.mp4"), 0, 160, QStringLiteral("missing|1"), true);
 
   QCOMPARE(readySpy.count(), 0);
   QCOMPARE(failedSpy.count(), 1);
@@ -233,7 +236,7 @@ void TestTrickplay::testKeyframeFrameArrivesFirst()
   QSignalSpy failedSpy(&worker, &TrickplayWorker::failed);
 
   worker.setLatestRequest(1);
-  worker.generate(1, media, 2500, 160, QStringLiteral("phases|1"));
+  worker.generate(1, media, 2500, 160, QStringLiteral("phases|1"), true);
 
   QCOMPARE(failedSpy.count(), 0);
   QCOMPARE(readySpy.count(), 2);
@@ -246,6 +249,64 @@ void TestTrickplay::testKeyframeFrameArrivesFirst()
   QCOMPARE(exact.size(), QSize(160, 90));
 }
 
+void TestTrickplay::testSpeculativeRequestStopsAtTheKeyframe()
+{
+  const QString media = QFINDTESTDATA("data/trickplay.mp4");
+  QVERIFY2(!media.isEmpty(), "Test video not found");
+
+  TrickplayWorker worker(false, QString(), QString());
+  QSignalSpy readySpy(&worker, &TrickplayWorker::ready);
+  QSignalSpy failedSpy(&worker, &TrickplayWorker::failed);
+
+  // A speculative frame is answered by the keyframe frame alone: decoding up to
+  // the guessed position would cost the most time and most of the bytes read
+  // from the server for a frame the pointer may never look at.
+  worker.setLatestRequest(1);
+  worker.generate(1, media, 2500, 160, QStringLiteral("speculative|1"), false);
+
+  QCOMPARE(failedSpy.count(), 0);
+  QCOMPARE(readySpy.count(), 1);
+  QCOMPARE(readySpy.at(0).at(5).toBool(), false);
+
+  // Asking again for that key finishes it.
+  worker.setLatestRequest(2);
+  worker.generate(2, media, 2500, 160, QStringLiteral("speculative|1"), true);
+
+  QCOMPARE(failedSpy.count(), 0);
+  const QList<QVariant> exact = frameAtRequestedPosition(readySpy);
+  QVERIFY(!exact.isEmpty());
+  QVERIFY(exact.at(2).toString() != readySpy.at(0).at(2).toString());
+}
+
+void TestTrickplay::testBrokenStreamIsRememberedPerUrl()
+{
+  const QString media = QFINDTESTDATA("data/trickplay.mp4");
+  QVERIFY2(!media.isEmpty(), "Test video not found");
+  const QString missing = QStringLiteral("/nonexistent/trickplay-preview.mp4");
+
+  TrickplayWorker worker(false, QString(), QString());
+  QSignalSpy readySpy(&worker, &TrickplayWorker::ready);
+  QSignalSpy failedSpy(&worker, &TrickplayWorker::failed);
+
+  worker.setLatestRequest(1);
+  worker.generate(1, missing, 0, 160, QStringLiteral("broken|1"), true);
+  QCOMPARE(failedSpy.count(), 1);
+  const QString reason = failedSpy.at(0).at(2).toString();
+
+  // The seek bar asks again for every hovered spot. A stream that just failed
+  // is answered from memory instead of starting another load that fails the
+  // same way.
+  worker.setLatestRequest(2);
+  worker.generate(2, missing, 1000, 160, QStringLiteral("broken|2"), true);
+  QCOMPARE(failedSpy.count(), 2);
+  QCOMPARE(failedSpy.at(1).at(2).toString(), reason);
+
+  // Another stream must not inherit that failure.
+  worker.setLatestRequest(3);
+  worker.generate(3, media, 500, 160, QStringLiteral("broken|3"), true);
+  QVERIFY(!frameAtRequestedPosition(readySpy).isEmpty());
+}
+
 void TestTrickplay::testTempDirStaysPrivate()
 {
   const QString media = QFINDTESTDATA("data/trickplay.mp4");
@@ -255,7 +316,7 @@ void TestTrickplay::testTempDirStaysPrivate()
   QSignalSpy readySpy(&worker, &TrickplayWorker::ready);
 
   worker.setLatestRequest(1);
-  worker.generate(1, media, 500, 160, QStringLiteral("private|1"));
+  worker.generate(1, media, 500, 160, QStringLiteral("private|1"), true);
   QVERIFY(!frameAtRequestedPosition(readySpy).isEmpty());
 
   const QString dir = QDir(QDir::tempPath())
@@ -286,7 +347,7 @@ void TestTrickplay::testComponentDeliversThumbnail()
 
   // Preparing the stream ahead of the first request must not break the request.
   component.prepare(media);
-  component.requestThumbnail(media, 1000, 160, QStringLiteral("component|test"));
+  component.requestThumbnail(media, 1000, 160, QStringLiteral("component|test"), true);
 
   QTRY_VERIFY_WITH_TIMEOUT(!finalThumbnail(readySpy).isEmpty(), 15000);
   QCOMPARE(failedSpy.count(), 0);

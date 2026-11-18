@@ -1,6 +1,7 @@
 #include "TrickplayWorker.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDebug>
 #include <QDir>
 #include <QElapsedTimer>
@@ -20,6 +21,9 @@ constexpr int kSettleTimeoutMs = 1000;
 // detected one poll late. A short poll keeps that below a frame time.
 constexpr double kFramePollSeconds = 0.002;
 constexpr int kStaleTempDirHours = 1;
+// How long a stream that failed to load is remembered, so the next preview does
+// not start another half-minute of timeouts against the same broken URL.
+constexpr qint64 kLoadFailureMemoryMs = 60000;
 constexpr int kCacheEntries = 500;
 // A keyframe seek lands on the previous keyframe, which is exactly the
 // requested frame when the two are this close. Anything further away gets the
@@ -488,19 +492,23 @@ bool TrickplayWorker::seekAndCapture(quint64 id, qint64 positionMs, SeekMode mod
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+QString TrickplayWorker::dataUrl(const QByteArray& jpeg)
+{
+  return QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(jpeg.toBase64());
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 void TrickplayWorker::deliver(quint64 id, const QString& cacheKey, const QByteArray& jpeg, int width,
                               int height, bool finalFrame)
 {
-  const QString dataUrl = QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(jpeg.toBase64());
-
   Thumbnail* thumbnail = new Thumbnail;
-  thumbnail->dataUrl = dataUrl;
+  thumbnail->jpeg = jpeg;
   thumbnail->width = width;
   thumbnail->height = height;
   thumbnail->finalFrame = finalFrame;
   m_cache.insert(cacheKey, thumbnail);
 
-  emit ready(id, cacheKey, dataUrl, width, height, finalFrame);
+  emit ready(id, cacheKey, dataUrl(jpeg), width, height, finalFrame);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -513,8 +521,12 @@ void TrickplayWorker::prepare(const QString& url)
   if (!initializeMpv(error))
     return;
 
-  if (loadUrl(m_latestId.load(), url, error))
+  if (loadUrl(m_latestId.load(), url, error)) {
+    // The stream is readable again, so a remembered failure no longer applies.
+    m_failedUrl.clear();
+    m_failedError.clear();
     return;
+  }
 
   // Nothing is playing yet, so a failure here is not worth reporting: the
   // request that needs the stream will load it and report the real error.
@@ -522,14 +534,21 @@ void TrickplayWorker::prepare(const QString& url)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs, int width, const QString& cacheKey)
+void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs, int width,
+                               const QString& cacheKey, bool refine)
 {
   if (isCancelled(id))
     return;
 
   if (const Thumbnail* cached = m_cache.object(cacheKey)) {
     if (cached->finalFrame) {
-      emit ready(id, cacheKey, cached->dataUrl, cached->width, cached->height, true);
+      emit ready(id, cacheKey, dataUrl(cached->jpeg), cached->width, cached->height, true);
+      return;
+    }
+
+    // The cheap frame is all a background request asked for, and it is here.
+    if (!refine) {
+      emit ready(id, cacheKey, dataUrl(cached->jpeg), cached->width, cached->height, false);
       return;
     }
   }
@@ -543,14 +562,32 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
 
   applyScale(width);
 
+  // Retrying a stream that just failed only repeats the same timeout. The
+  // seek bar asks for every hovered spot, so failing fast is what keeps a
+  // broken item from occupying the worker for a minute at a time.
+  if (url == m_failedUrl
+      && QDateTime::currentMSecsSinceEpoch() - m_failedAt < kLoadFailureMemoryMs) {
+    if (!isCancelled(id))
+      emit failed(id, cacheKey, m_failedError);
+    return;
+  }
+
   QElapsedTimer timer;
   timer.start();
 
   if (!loadUrl(id, url, error)) {
-    if (!isCancelled(id))
-      emit failed(id, cacheKey, error);
+    if (isCancelled(id))
+      return;
+
+    m_failedUrl = url;
+    m_failedError = error;
+    m_failedAt = QDateTime::currentMSecsSinceEpoch();
+    emit failed(id, cacheKey, error);
     return;
   }
+
+  m_failedUrl.clear();
+  m_failedError.clear();
 
   const qint64 loadMs = timer.restart();
 
@@ -573,7 +610,9 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
   // Keyframe seeking lands on the previous keyframe, which is up to one
   // keyframe interval early. When that is close enough the frame is already
   // the one the exact seek would produce, so the expensive pass is skipped.
-  if (landedMs >= 0 && qAbs(landedMs - positionMs) <= kRefineToleranceMs) {
+  const bool exactEnough = landedMs >= 0 && qAbs(landedMs - positionMs) <= kRefineToleranceMs;
+
+  if (exactEnough) {
     if (m_logTimings) {
       qDebug() << "Trickplay frame ready at" << positionMs << "ms: load" << loadMs << "ms, keyframe"
                << keyframeMs << "ms, exact (same keyframe)";
@@ -584,10 +623,15 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
 
   if (m_logTimings) {
     qDebug() << "Trickplay frame at" << positionMs << "ms from keyframe" << landedMs << "ms: load"
-             << loadMs << "ms, keyframe" << keyframeMs << "ms";
+             << loadMs << "ms, keyframe" << keyframeMs << "ms" << (refine ? "" : ", no refine");
   }
 
   deliver(id, cacheKey, jpeg, frameWidth, frameHeight, false);
+
+  // A speculative request is answered by the cheap frame; the position it
+  // guessed may never be looked at, so decoding up to it would be wasted.
+  if (!refine)
+    return;
 
   if (isCancelled(id))
     return;

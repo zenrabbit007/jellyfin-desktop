@@ -71,7 +71,8 @@ void TrickplayComponent::ensureWorker()
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-void TrickplayComponent::requestThumbnail(const QString& url, qint64 positionMs, int width, const QString& cacheKey)
+void TrickplayComponent::requestThumbnail(const QString& url, qint64 positionMs, int width,
+                                         const QString& cacheKey, bool refine)
 {
   if (url.isEmpty() || cacheKey.isEmpty() || positionMs < 0)
     return;
@@ -90,7 +91,8 @@ void TrickplayComponent::requestThumbnail(const QString& url, qint64 positionMs,
                             Q_ARG(QString, url),
                             Q_ARG(qint64, positionMs),
                             Q_ARG(int, width),
-                            Q_ARG(QString, cacheKey));
+                            Q_ARG(QString, cacheKey),
+                            Q_ARG(bool, refine));
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

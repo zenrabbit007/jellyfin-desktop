@@ -1,6 +1,7 @@
 #ifndef TRICKPLAYWORKER_H
 #define TRICKPLAYWORKER_H
 
+#include <QByteArray>
 #include <QCache>
 #include <QObject>
 #include <QString>
@@ -33,7 +34,11 @@ public:
   void requestShutdown();
 
 public Q_SLOTS:
-  void generate(quint64 id, const QString& url, qint64 positionMs, int width, const QString& cacheKey);
+  /// refine=false stops after the keyframe frame, which is what speculative
+  /// (prefetch) requests want: it skips the exact seek that costs most of the
+  /// decode and most of the bytes read from the server.
+  void generate(quint64 id, const QString& url, qint64 positionMs, int width, const QString& cacheKey,
+                bool refine);
 
   /// Loads url ahead of the first preview so the first hover only pays for a
   /// seek. Safe to call for the stream that is already playing.
@@ -51,7 +56,10 @@ Q_SIGNALS:
 
 private:
   struct Thumbnail {
-    QString dataUrl;
+    // The JPEG is kept as it came out of mpv. A data URL is only built when the
+    // frame is delivered: the base64 text is nearly three times the size of the
+    // image, and the whole cache is held in memory.
+    QByteArray jpeg;
     int width = 0;
     int height = 0;
     bool finalFrame = false;
@@ -74,6 +82,7 @@ private:
   bool isCancelled(quint64 id) const;
   void deliver(quint64 id, const QString& cacheKey, const QByteArray& jpeg, int width, int height,
                bool finalFrame);
+  static QString dataUrl(const QByteArray& jpeg);
   void drainEvents();
   void cleanupFiles();
   int runCommand(const QStringList& args);
@@ -92,6 +101,11 @@ private:
   std::atomic<bool> m_shutdown{false};
   bool m_initFailed = false;
   int m_scaleWidth = 0;
+  // A URL that failed to load is not retried for a while: every attempt costs
+  // the full load timeout, and the seek bar asks again for each hovered spot.
+  QString m_failedUrl;
+  QString m_failedError;
+  qint64 m_failedAt = 0;
 };
 
 #endif // TRICKPLAYWORKER_H

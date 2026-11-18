@@ -32,8 +32,10 @@ public:
   /// asynchronously through thumbnailReady() or thumbnailFailed(), keyed by
   /// cacheKey so the caller can match it to the request. thumbnailReady() can
   /// arrive twice for one request: first with the frame at the keyframe before
-  /// positionMs, then with the frame at positionMs itself.
-  Q_INVOKABLE void requestThumbnail(const QString& url, qint64 positionMs, int width, const QString& cacheKey);
+  /// positionMs, then with the frame at positionMs itself. refine=false asks
+  /// for the first of the two only, which is enough for a speculative frame.
+  Q_INVOKABLE void requestThumbnail(const QString& url, qint64 positionMs, int width,
+                                    const QString& cacheKey, bool refine);
 
   /// Loads url into the preview player before the first frame is requested, so
   /// the first hover does not pay for opening the stream.
