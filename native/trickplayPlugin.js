@@ -182,9 +182,11 @@ class trickplayPlugin {
         this.patchCount = 0;
         this.lastItemKey = null;
         this.preparedKey = null;
+        this.streamOpenedKey = null;
         this.producedItems = new Set();
         this.itemFailures = new Map();
         this.failedItems = new Set();
+        this.refineFailures = new Set();
         this.loggedHookItem = null;
         this.loggedServerItem = null;
         this.loggedServerUnused = null;
@@ -316,6 +318,22 @@ class trickplayPlugin {
             };
 
             this.hooks.set(slider, record);
+
+            // The client hides the bubble when the pointer leaves the seek bar
+            // and nothing calls back into here afterwards, so leaving has to be
+            // observed: work left behind would decode, and download, a frame
+            // for a preview that is no longer on screen.
+            const leave = (event) => {
+                // A drag that wanders off the bar still owns the bubble.
+                if (event?.buttons) {
+                    return;
+                }
+
+                plugin.onSliderLeave(slider);
+            };
+
+            slider.addEventListener('pointerleave', leave, { passive: true });
+            slider.addEventListener('pointercancel', leave, { passive: true });
         } else {
             // The client replaced the property, so our accessor is gone.
             record.original = slider.updateBubbleHtml;
@@ -437,7 +455,16 @@ class trickplayPlugin {
         // Opening the stream costs a connection and a header read, so it only
         // happens once the player has a source of its own. After that the first
         // hover only pays for a seek.
+        this.prepareStream(info);
+    }
+
+    prepareStream(info) {
+        if (!this.api?.trickplay?.prepare) {
+            return;
+        }
+
         this.preparedKey = info.cacheKey;
+        this.streamOpenedKey = info.cacheKey;
         this.debug('Trickplay Preview: opened the stream ahead of the first hover');
 
         try {
@@ -517,6 +544,13 @@ class trickplayPlugin {
             this.lastItemKey = info.cacheKey;
             this.lastBucket = null;
             this.direction = 1;
+
+            // Frames that could not be produced earlier in the session were
+            // often a passing server or network problem: a new playback gets a
+            // fresh chance at a preview.
+            if (this.failedItems.delete(info.cacheKey)) {
+                this.debug('Trickplay Preview: previewing this item again after earlier failures');
+            }
         }
 
         if (this.lastBucket !== null && bucket !== this.lastBucket) {
@@ -568,9 +602,15 @@ class trickplayPlugin {
         const tile = bubble?.querySelector?.('.chapterThumbWrapper');
         const rendered = Boolean(tile && String(tile.style.backgroundImage).includes('/Trickplay/'));
 
-        if (!rendered && this.loggedServerUnused !== info.cacheKey) {
-            this.loggedServerUnused = info.cacheKey;
-            this.debug('Trickplay Preview: the server has trickplay tiles for this item but the client did not render one, using native frames');
+        if (!rendered && this.streamOpenedKey !== info.cacheKey) {
+            if (this.loggedServerUnused !== info.cacheKey) {
+                this.loggedServerUnused = info.cacheKey;
+                this.debug('Trickplay Preview: the server has trickplay tiles for this item but the client did not render one, using native frames');
+            }
+
+            // The native frames are used after all, so open their stream now
+            // instead of making the first hover wait for it.
+            this.prepareStream(info);
         }
 
         return rendered;
@@ -596,6 +636,14 @@ class trickplayPlugin {
 
     scheduleRefine(info, bucket, key) {
         this.cancelRefine();
+
+        // The exact frame for this position could not be produced before, so
+        // the keyframe frame stays on screen instead of paying for a seek that
+        // fails the same way every time the pointer comes back.
+        if (this.refineFailures.has(key)) {
+            return;
+        }
+
         this.refineTimer = window.setTimeout(() => {
             this.refineTimer = undefined;
 
@@ -617,6 +665,21 @@ class trickplayPlugin {
             window.clearTimeout(this.refineTimer);
             this.refineTimer = undefined;
         }
+    }
+
+    onSliderLeave(slider) {
+        if (this.hover?.slider !== slider) {
+            return;
+        }
+
+        // Nothing calls back into the plugin once the bubble is hidden, so
+        // whatever is still scheduled or queued here would only decode frames
+        // for a preview that is no longer on screen.
+        this.hover = null;
+        this.lastBucket = null;
+        this.cancelHoverRequest();
+        this.prefetchQueue = [];
+        this.cancelPrefetchTimer();
     }
 
     cancelHoverRequest() {
@@ -1029,6 +1092,13 @@ class trickplayPlugin {
         this.dropSupersededRequest();
         if (this.lastRequestedKey === cacheKey) {
             this.lastRequestedKey = null;
+        }
+
+        // A position that already had its keyframe frame keeps it: the exact
+        // frame is not asked for again, so a stream that cannot seek that far
+        // does not stall the previews on every hover of the same spot.
+        if (this.cache.get(cacheKey)?.final === false) {
+            this.refineFailures.add(cacheKey);
         }
 
         this.recordFailure(splitKey(cacheKey).itemKey);
