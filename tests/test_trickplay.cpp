@@ -32,6 +32,30 @@ QImage decodeThumbnail(const QString& dataUrl)
   image.loadFromData(QByteArray::fromBase64(dataUrl.mid(prefix.size()).toLatin1()), "JPEG");
   return image;
 }
+
+// A request is answered by the frame at the keyframe first (finalFrame false)
+// and by the frame at the requested position afterwards (finalFrame true).
+QList<QVariant> frameAtRequestedPosition(const QSignalSpy& spy)
+{
+  for (int index = 0; index < spy.count(); ++index) {
+    const QList<QVariant> args = spy.at(index);
+    if (args.size() > 5 && args.at(5).toBool())
+      return args;
+  }
+
+  return {};
+}
+
+QList<QVariant> finalThumbnail(const QSignalSpy& spy)
+{
+  for (int index = 0; index < spy.count(); ++index) {
+    const QList<QVariant> args = spy.at(index);
+    if (args.size() > 4 && args.at(4).toBool())
+      return args;
+  }
+
+  return {};
+}
 }
 
 class TestTrickplay : public QObject
@@ -44,6 +68,7 @@ private slots:
   void testSwitchingMedia();
   void testFrameMatchesRequestedPosition();
   void testMissingMediaFails();
+  void testKeyframeFrameArrivesFirst();
   void testComponentDeliversThumbnail();
 };
 
@@ -60,9 +85,8 @@ void TestTrickplay::testGeneratesFrameAtRequestedPosition()
   worker.generate(1, media, 500, 160, QStringLiteral("item|1"));
 
   QCOMPARE(failedSpy.count(), 0);
-  QCOMPARE(readySpy.count(), 1);
-
-  const QList<QVariant> args = readySpy.takeFirst();
+  const QList<QVariant> args = frameAtRequestedPosition(readySpy);
+  QVERIFY(!args.isEmpty());
   QCOMPARE(args.at(0).toULongLong(), 1ULL);
   QCOMPARE(args.at(1).toString(), QStringLiteral("item|1"));
 
@@ -90,23 +114,23 @@ void TestTrickplay::testDifferentPositionsAndCache()
   worker.setLatestRequest(1);
   worker.generate(1, media, 500, 160, QStringLiteral("item|first"));
   QCOMPARE(failedSpy.count(), 0);
-  QCOMPARE(readySpy.count(), 1);
-  const QString first = readySpy.at(0).at(2).toString();
+  const QString first = frameAtRequestedPosition(readySpy).at(2).toString();
 
+  readySpy.clear();
   worker.setLatestRequest(2);
   worker.generate(2, media, 2500, 160, QStringLiteral("item|second"));
   QCOMPARE(failedSpy.count(), 0);
-  QCOMPARE(readySpy.count(), 2);
-  const QString second = readySpy.at(1).at(2).toString();
+  const QString second = frameAtRequestedPosition(readySpy).at(2).toString();
 
   QVERIFY2(first != second, "Different positions should produce different frames");
 
   // A cached key is answered from memory and yields the exact same frame.
+  readySpy.clear();
   worker.setLatestRequest(3);
   worker.generate(3, media, 500, 160, QStringLiteral("item|first"));
   QCOMPARE(failedSpy.count(), 0);
-  QCOMPARE(readySpy.count(), 3);
-  QCOMPARE(readySpy.at(2).at(2).toString(), first);
+  QCOMPARE(readySpy.count(), 1);
+  QCOMPARE(readySpy.at(0).at(2).toString(), first);
 }
 
 void TestTrickplay::testSwitchingMedia()
@@ -124,17 +148,17 @@ void TestTrickplay::testSwitchingMedia()
   worker.setLatestRequest(1);
   worker.generate(1, media, 1000, 160, QStringLiteral("first|1"));
   QCOMPARE(failedSpy.count(), 0);
-  QCOMPARE(readySpy.count(), 1);
+  const QImage first = decodeThumbnail(frameAtRequestedPosition(readySpy).at(2).toString());
 
   // Playing another video must reuse the preview player for the new stream.
+  readySpy.clear();
   worker.setLatestRequest(2);
   worker.generate(2, otherMedia, 1000, 160, QStringLiteral("second|1"));
   QCOMPARE(failedSpy.count(), 0);
-  QCOMPARE(readySpy.count(), 2);
-  QCOMPARE(readySpy.at(1).at(1).toString(), QStringLiteral("second|1"));
+  const QList<QVariant> secondFrame = frameAtRequestedPosition(readySpy);
+  QCOMPARE(secondFrame.at(1).toString(), QStringLiteral("second|1"));
 
-  const QImage first = decodeThumbnail(readySpy.at(0).at(2).toString());
-  const QImage second = decodeThumbnail(readySpy.at(1).at(2).toString());
+  const QImage second = decodeThumbnail(secondFrame.at(2).toString());
   QVERIFY(!first.isNull());
   QVERIFY(!second.isNull());
   QVERIFY2(first != second, "The second video should produce its own frames");
@@ -163,13 +187,15 @@ void TestTrickplay::testFrameMatchesRequestedPosition()
   int id = 0;
   for (const auto& testCase : cases) {
     ++id;
+    readySpy.clear();
     worker.setLatestRequest(id);
     worker.generate(id, media, testCase.positionMs, 160, QStringLiteral("colour|%1").arg(testCase.positionMs));
 
     QCOMPARE(failedSpy.count(), 0);
-    QCOMPARE(readySpy.count(), 1);
+    const QList<QVariant> args = frameAtRequestedPosition(readySpy);
+    QVERIFY2(!args.isEmpty(), "No frame at the requested position was delivered");
 
-    const QImage image = decodeThumbnail(readySpy.takeFirst().at(2).toString());
+    const QImage image = decodeThumbnail(args.at(2).toString());
     QVERIFY(!image.isNull());
     QCOMPARE(dominantColor(image.scaled(1, 1).pixelColor(0, 0)), testCase.expected);
   }
@@ -192,6 +218,31 @@ void TestTrickplay::testMissingMediaFails()
   QVERIFY2(timer.elapsed() < 5000, "A missing file should fail without stalling the preview");
 }
 
+void TestTrickplay::testKeyframeFrameArrivesFirst()
+{
+  // The keyframe here is a second away from the requested position, so the
+  // frame at the keyframe is delivered first and the exact frame afterwards.
+  const QString media = QFINDTESTDATA("data/trickplay.mp4");
+  QVERIFY2(!media.isEmpty(), "Test video not found");
+
+  TrickplayWorker worker(false, QString(), QString());
+  QSignalSpy readySpy(&worker, &TrickplayWorker::ready);
+  QSignalSpy failedSpy(&worker, &TrickplayWorker::failed);
+
+  worker.setLatestRequest(1);
+  worker.generate(1, media, 2500, 160, QStringLiteral("phases|1"));
+
+  QCOMPARE(failedSpy.count(), 0);
+  QCOMPARE(readySpy.count(), 2);
+  QCOMPARE(readySpy.at(0).at(5).toBool(), false);
+  QCOMPARE(readySpy.at(1).at(5).toBool(), true);
+
+  const QImage fast = decodeThumbnail(readySpy.at(0).at(2).toString());
+  const QImage exact = decodeThumbnail(readySpy.at(1).at(2).toString());
+  QCOMPARE(fast.size(), QSize(160, 90));
+  QCOMPARE(exact.size(), QSize(160, 90));
+}
+
 void TestTrickplay::testComponentDeliversThumbnail()
 {
   const QString media = QFINDTESTDATA("data/trickplay.mp4");
@@ -203,12 +254,14 @@ void TestTrickplay::testComponentDeliversThumbnail()
   QSignalSpy readySpy(&component, &TrickplayComponent::thumbnailReady);
   QSignalSpy failedSpy(&component, &TrickplayComponent::thumbnailFailed);
 
+  // Preparing the stream ahead of the first request must not break the request.
+  component.prepare(media);
   component.requestThumbnail(media, 1000, 160, QStringLiteral("component|test"));
 
-  QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 15000);
+  QTRY_VERIFY_WITH_TIMEOUT(!finalThumbnail(readySpy).isEmpty(), 15000);
   QCOMPARE(failedSpy.count(), 0);
 
-  const QList<QVariant> args = readySpy.takeFirst();
+  const QList<QVariant> args = finalThumbnail(readySpy);
   QCOMPARE(args.at(0).toString(), QStringLiteral("component|test"));
   QVERIFY(args.at(1).toString().startsWith(QStringLiteral("data:image/jpeg;base64,")));
   QCOMPARE(args.at(2).toInt(), 160);

@@ -94,12 +94,22 @@ void TrickplayComponent::requestThumbnail(const QString& url, qint64 positionMs,
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-void TrickplayComponent::onReady(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height)
+void TrickplayComponent::prepare(const QString& url)
+{
+  if (url.isEmpty())
+    return;
+
+  ensureWorker();
+  QMetaObject::invokeMethod(m_worker, "prepare", Qt::QueuedConnection, Q_ARG(QString, url));
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+void TrickplayComponent::onReady(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height, bool finalFrame)
 {
   if (id != m_latestRequestId)
     return;
 
-  emit thumbnailReady(cacheKey, dataUrl, width, height);
+  emit thumbnailReady(cacheKey, dataUrl, width, height, finalFrame);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

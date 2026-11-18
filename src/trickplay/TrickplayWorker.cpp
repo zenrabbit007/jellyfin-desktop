@@ -17,6 +17,10 @@ constexpr int kLoadTimeoutMs = 30000;
 constexpr int kSeekTimeoutMs = 15000;
 constexpr int kSettleTimeoutMs = 1000;
 constexpr int kCacheEntries = 500;
+// A keyframe seek lands on the previous keyframe, which is exactly the
+// requested frame when the two are this close. Anything further away gets the
+// exact seek afterwards, so a preview always ends up on the requested frame.
+constexpr qint64 kRefineToleranceMs = 100;
 
 QString mpvErrorString(int error)
 {
@@ -365,7 +369,18 @@ bool TrickplayWorker::waitForIdle(quint64 id, int timeoutMs)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-bool TrickplayWorker::seekAndCapture(quint64 id, qint64 positionMs, QByteArray& jpeg, int& width, int& height, QString& error)
+double TrickplayWorker::currentPositionSeconds() const
+{
+  double position = 0;
+  if (!m_mpv || mpv_get_property(m_mpv, "time-pos", MPV_FORMAT_DOUBLE, &position) < 0)
+    return -1;
+
+  return position;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+bool TrickplayWorker::seekAndCapture(quint64 id, qint64 positionMs, SeekMode mode, QByteArray& jpeg,
+                                     int& width, int& height, QString& error)
 {
   double duration = 0;
   mpv_get_property(m_mpv, "duration", MPV_FORMAT_DOUBLE, &duration);
@@ -383,10 +398,12 @@ bool TrickplayWorker::seekAndCapture(quint64 id, qint64 positionMs, QByteArray& 
   cleanupFiles();
   drainEvents();
 
+  // Decoding from the keyframe before the position to the position itself is
+  // what makes a preview slow, so the first frame comes from the keyframe.
   const int rc = runCommand({
     QStringLiteral("seek"),
     QString::number(position, 'f', 3),
-    QStringLiteral("absolute+exact")
+    mode == SeekMode::Exact ? QStringLiteral("absolute+exact") : QStringLiteral("absolute+keyframes")
   });
 
   if (rc < 0) {
@@ -422,14 +439,50 @@ bool TrickplayWorker::seekAndCapture(quint64 id, qint64 positionMs, QByteArray& 
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+void TrickplayWorker::deliver(quint64 id, const QString& cacheKey, const QByteArray& jpeg, int width,
+                              int height, bool finalFrame)
+{
+  const QString dataUrl = QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(jpeg.toBase64());
+
+  Thumbnail* thumbnail = new Thumbnail;
+  thumbnail->dataUrl = dataUrl;
+  thumbnail->width = width;
+  thumbnail->height = height;
+  thumbnail->finalFrame = finalFrame;
+  m_cache.insert(cacheKey, thumbnail);
+
+  emit ready(id, cacheKey, dataUrl, width, height, finalFrame);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+void TrickplayWorker::prepare(const QString& url)
+{
+  if (m_shutdown.load() || url.isEmpty())
+    return;
+
+  QString error;
+  if (!initializeMpv(error))
+    return;
+
+  if (loadUrl(m_latestId.load(), url, error))
+    return;
+
+  // Nothing is playing yet, so a failure here is not worth reporting: the
+  // request that needs the stream will load it and report the real error.
+  m_loadedUrl.clear();
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs, int width, const QString& cacheKey)
 {
   if (isCancelled(id))
     return;
 
   if (const Thumbnail* cached = m_cache.object(cacheKey)) {
-    emit ready(id, cacheKey, cached->dataUrl, cached->width, cached->height);
-    return;
+    if (cached->finalFrame) {
+      emit ready(id, cacheKey, cached->dataUrl, cached->width, cached->height, true);
+      return;
+    }
   }
 
   QString error;
@@ -456,7 +509,7 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
   int frameWidth = 0;
   int frameHeight = 0;
 
-  if (!seekAndCapture(id, positionMs, jpeg, frameWidth, frameHeight, error)) {
+  if (!seekAndCapture(id, positionMs, SeekMode::Keyframe, jpeg, frameWidth, frameHeight, error)) {
     // A failed seek can unload the file (for example when it lands on the very
     // end), so the next request has to load it again.
     m_loadedUrl.clear();
@@ -465,16 +518,43 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
     return;
   }
 
+  const qint64 keyframeMs = timer.elapsed();
+  const double landedMs = currentPositionSeconds() * 1000.0;
+
+  // Keyframe seeking lands on the previous keyframe, which is up to one
+  // keyframe interval early. When that is close enough the frame is already
+  // the one the exact seek would produce, so the expensive pass is skipped.
+  if (landedMs >= 0 && qAbs(landedMs - positionMs) <= kRefineToleranceMs) {
+    if (m_logTimings) {
+      qDebug() << "Trickplay frame ready at" << positionMs << "ms: load" << loadMs << "ms, keyframe"
+               << keyframeMs << "ms, exact (same keyframe)";
+    }
+    deliver(id, cacheKey, jpeg, frameWidth, frameHeight, true);
+    return;
+  }
+
+  if (m_logTimings) {
+    qDebug() << "Trickplay frame at" << positionMs << "ms from keyframe" << landedMs << "ms: load"
+             << loadMs << "ms, keyframe" << keyframeMs << "ms";
+  }
+
+  deliver(id, cacheKey, jpeg, frameWidth, frameHeight, false);
+
+  if (isCancelled(id))
+    return;
+
+  timer.restart();
+
+  if (!seekAndCapture(id, positionMs, SeekMode::Exact, jpeg, frameWidth, frameHeight, error)) {
+    // The keyframe frame is already on screen; the caller keeps it.
+    m_loadedUrl.clear();
+    if (!isCancelled(id))
+      emit failed(id, cacheKey, tr("Could not refine the preview frame: %1").arg(error));
+    return;
+  }
+
   if (m_logTimings)
-    qDebug() << "Trickplay frame ready at" << positionMs << "ms: load" << loadMs << "ms, seek" << timer.elapsed() << "ms";
+    qDebug() << "Trickplay frame refined at" << positionMs << "ms: exact" << timer.elapsed() << "ms";
 
-  const QString dataUrl = QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(jpeg.toBase64());
-
-  Thumbnail* thumbnail = new Thumbnail;
-  thumbnail->dataUrl = dataUrl;
-  thumbnail->width = frameWidth;
-  thumbnail->height = frameHeight;
-  m_cache.insert(cacheKey, thumbnail);
-
-  emit ready(id, cacheKey, dataUrl, frameWidth, frameHeight);
+  deliver(id, cacheKey, jpeg, frameWidth, frameHeight, true);
 }

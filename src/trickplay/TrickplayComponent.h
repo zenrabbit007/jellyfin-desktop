@@ -30,16 +30,23 @@ public:
 
   /// Requests a preview frame from url at positionMs. The result is delivered
   /// asynchronously through thumbnailReady() or thumbnailFailed(), keyed by
-  /// cacheKey so the caller can match it to the request.
+  /// cacheKey so the caller can match it to the request. thumbnailReady() can
+  /// arrive twice for one request: first with the frame at the keyframe before
+  /// positionMs, then with the frame at positionMs itself.
   Q_INVOKABLE void requestThumbnail(const QString& url, qint64 positionMs, int width, const QString& cacheKey);
 
+  /// Loads url into the preview player before the first frame is requested, so
+  /// the first hover does not pay for opening the stream.
+  Q_INVOKABLE void prepare(const QString& url);
+
 Q_SIGNALS:
-  void thumbnailReady(const QString& cacheKey, const QString& dataUrl, int width, int height);
+  void thumbnailReady(const QString& cacheKey, const QString& dataUrl, int width, int height,
+                      bool finalFrame);
   void thumbnailFailed(const QString& cacheKey, const QString& error);
 
 private:
   void ensureWorker();
-  void onReady(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height);
+  void onReady(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height, bool finalFrame);
   void onFailed(quint64 id, const QString& cacheKey, const QString& error);
 
   QThread* m_thread = nullptr;

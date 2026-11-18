@@ -23,6 +23,13 @@ const HOVER_REQUEST_DELAY_MS = 120;
 // being read and never produce a frame.
 const IN_FLIGHT_TIMEOUT_MS = 50000;
 const REQUEST_TIMEOUT_MS = 60000;
+// Opening the stream before the first hover saves a load on every preview.
+// Waiting lets the player buffer first, so both do not compete for the link.
+const PREPARE_DELAY_MS = 2000;
+
+function debugEnabled() {
+    return window.jmpInfo?.settings?.video?.['debug.trickplay_timings'] === true;
+}
 
 function formatTime(ms) {
     const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -153,6 +160,9 @@ class trickplayPlugin {
         this.direction = 1;
         this.patchScheduled = false;
         this.patchCount = 0;
+        this.lastItemKey = null;
+        this.preparedKey = null;
+        this.prepareCandidate = null;
         this.loggedHookItem = null;
         this.loggedServerItem = null;
         this.loggedServerUnused = null;
@@ -177,7 +187,16 @@ class trickplayPlugin {
         // bar it belongs to can be replaced (or lose our accessor) without any
         // DOM mutation the observer would see. A cheap identity check keeps the
         // hook alive for the second and every later video of a session.
-        window.setInterval(() => this.patchSlider(), 500);
+        window.setInterval(() => {
+            this.patchSlider();
+            this.schedulePrepare();
+        }, 500);
+    }
+
+    debug(message) {
+        if (debugEnabled()) {
+            console.info(message);
+        }
     }
 
     async init() {
@@ -189,12 +208,12 @@ class trickplayPlugin {
         }
 
         if (!this.api?.trickplay) {
-            console.log('Trickplay Preview: native component unavailable');
+            console.warn('Trickplay Preview: native component unavailable');
             return;
         }
 
-        this.api.trickplay.thumbnailReady.connect((cacheKey, dataUrl, width, height) => {
-            this.onThumbnailReady(cacheKey, dataUrl, width, height);
+        this.api.trickplay.thumbnailReady.connect((cacheKey, dataUrl, width, height, finalFrame) => {
+            this.onThumbnailReady(cacheKey, dataUrl, width, height, finalFrame);
         });
         this.api.trickplay.thumbnailFailed.connect((cacheKey, reason) => {
             this.onThumbnailFailed(cacheKey, reason);
@@ -236,7 +255,7 @@ class trickplayPlugin {
 
         if (sliders.length > 1 && !this.loggedStaleOsd) {
             this.loggedStaleOsd = true;
-            console.info('Trickplay Preview: ' + sliders.length
+            this.debug('Trickplay Preview: ' + sliders.length
                 + ' video OSD pages are in the document, watching all of their seek bars');
         }
     }
@@ -266,7 +285,7 @@ class trickplayPlugin {
                         // preview down with it.
                         if (plugin.loggedHandlerError !== String(error)) {
                             plugin.loggedHandlerError = String(error);
-                            console.info('Trickplay Preview: the client bubble handler failed (' + error + ')');
+                            console.warn('Trickplay Preview: the client bubble handler failed (' + error + ')');
                         }
                     }
                 }
@@ -303,7 +322,7 @@ class trickplayPlugin {
         }
 
         this.patchCount += 1;
-        console.info('Trickplay Preview: hooked the seek bar (' + this.patchCount + (
+        this.debug('Trickplay Preview: hooked the seek bar (' + this.patchCount + (
             this.patchCount === 1 ? ')' : ', the client had changed the handler)'
         ));
     }
@@ -372,11 +391,50 @@ class trickplayPlugin {
         };
     }
 
+    schedulePrepare() {
+        if (!this.api?.trickplay?.prepare || !isPreviewEnabled()) {
+            return;
+        }
+
+        const info = this.getPlaybackInfo();
+        if (!info) {
+            this.prepareCandidate = null;
+            return;
+        }
+
+        if (this.preparedKey === info.cacheKey) {
+            this.prepareCandidate = null;
+            return;
+        }
+
+        // Only open the stream once the same item has been playing for a
+        // moment, so the preview never competes with the initial buffering.
+        const now = performance.now();
+        if (this.prepareCandidate?.cacheKey !== info.cacheKey) {
+            this.prepareCandidate = { cacheKey: info.cacheKey, url: info.url, since: now };
+            return;
+        }
+
+        if (now - this.prepareCandidate.since < PREPARE_DELAY_MS) {
+            return;
+        }
+
+        this.preparedKey = info.cacheKey;
+        this.prepareCandidate = null;
+        this.debug('Trickplay Preview: opened the stream ahead of the first hover');
+
+        try {
+            this.api.trickplay.prepare(info.url);
+        } catch (error) {
+            console.warn('Trickplay Preview: could not open the stream ahead of time', error);
+        }
+    }
+
     onSliderBubbleUpdate(slider, bubble, value) {
         if (!this.api?.trickplay || !isPreviewEnabled()) {
             if (!this.loggedDisabled) {
                 this.loggedDisabled = true;
-                console.info('Trickplay Preview: hook ran but previews are off ('
+                this.debug('Trickplay Preview: hook ran but previews are off ('
                     + (!this.api?.trickplay ? 'native component unavailable' : 'setting disabled') + ')');
             }
 
@@ -392,7 +450,7 @@ class trickplayPlugin {
         if (!info) {
             if (!this.warnedNoInfo) {
                 this.warnedNoInfo = true;
-                console.info('Trickplay Preview: nothing to preview (' + (this.noPreviewReason || 'unknown') + ')');
+                this.debug('Trickplay Preview: nothing to preview (' + (this.noPreviewReason || 'unknown') + ')');
             }
             this.hover = null;
             this.prefetchQueue = [];
@@ -411,7 +469,7 @@ class trickplayPlugin {
 
             if (this.loggedServerItem !== info.cacheKey) {
                 this.loggedServerItem = info.cacheKey;
-                console.info('Trickplay Preview: using the server trickplay tiles for item ' + info.item.Id);
+                this.debug('Trickplay Preview: using the server trickplay tiles for item ' + info.item.Id);
             }
 
             return true;
@@ -419,14 +477,14 @@ class trickplayPlugin {
 
         if (this.loggedHookItem !== info.cacheKey) {
             this.loggedHookItem = info.cacheKey;
-            console.info('Trickplay Preview: hook is active for item ' + info.item.Id);
+            this.debug('Trickplay Preview: hook is active for item ' + info.item.Id);
         }
 
         const positionMs = info.durationMs * value / 100;
         if (!Number.isFinite(positionMs) || positionMs < 0) {
             if (!this.loggedBadValue) {
                 this.loggedBadValue = true;
-                console.info('Trickplay Preview: unusable slider value ' + value
+                this.debug('Trickplay Preview: unusable slider value ' + value
                     + ' (duration ' + info.durationMs + ' ms)');
             }
             return false;
@@ -436,20 +494,35 @@ class trickplayPlugin {
 
         const bucket = Math.floor(positionMs / info.interval) * info.interval;
 
+        // Direction drives the prefetch and the last bucket of the previous
+        // item would point the wrong way on the first hover of the next one.
+        if (this.lastItemKey !== info.cacheKey) {
+            this.lastItemKey = info.cacheKey;
+            this.lastBucket = null;
+            this.direction = 1;
+        }
+
         if (this.lastBucket !== null && bucket !== this.lastBucket) {
             this.direction = bucket > this.lastBucket ? 1 : -1;
         }
         this.lastBucket = bucket;
 
         const key = info.cacheKey + '|' + bucket;
-        const cached = this.cache.get(key);
+        const cached = this.lookupThumbnail(key);
 
         this.hover = { bubble, key, positionMs, info, slider };
-        this.logHover(bucket, cached ? 'cached' : (this.findNearby(info, bucket) ? 'nearby' : (this.lastFrameThumbnail(info) ? 'last' : 'none')));
+        this.logHover(bucket, cached ? (cached.final === false ? 'keyframe' : 'cached') : (this.findNearby(info, bucket) ? 'nearby' : (this.lastFrameThumbnail(info) ? 'last' : 'none')));
 
         if (cached) {
             this.renderThumbnail(slider, bubble, info, positionMs, cached);
-            this.schedulePrefetch(info, bucket);
+
+            if (cached.final === false) {
+                // This frame came from the keyframe before the position. Ask
+                // again now that the pointer came to rest here.
+                this.scheduleHoverRequest(info, bucket, key);
+            } else {
+                this.schedulePrefetch(info, bucket);
+            }
             return true;
         }
 
@@ -480,7 +553,7 @@ class trickplayPlugin {
 
         if (!rendered && this.loggedServerUnused !== info.cacheKey) {
             this.loggedServerUnused = info.cacheKey;
-            console.info('Trickplay Preview: the server has trickplay tiles for this item but the client did not render one, using native frames');
+            this.debug('Trickplay Preview: the server has trickplay tiles for this item but the client did not render one, using native frames');
         }
 
         return rendered;
@@ -509,6 +582,10 @@ class trickplayPlugin {
     }
 
     logHover(bucket, source) {
+        if (!debugEnabled()) {
+            return;
+        }
+
         const now = performance.now();
         if (this.lastHoverLogAt && now - this.lastHoverLogAt < 300) {
             this.lastHoverLogSource = source;
@@ -520,7 +597,7 @@ class trickplayPlugin {
     }
 
     verifyImage(bubble, info) {
-        if (this.loggedImageItem === info.cacheKey) {
+        if (!debugEnabled() || this.loggedImageItem === info.cacheKey) {
             return;
         }
 
@@ -552,35 +629,59 @@ class trickplayPlugin {
         const width = Math.max(1, Math.round(sourceWidth * scale));
         const height = Math.max(1, Math.round(sourceHeight * scale));
 
-        // Styled inline, after YouTube's seek preview: a hairline white frame
-        // around a rounded thumbnail with the time below, and no box around
-        // the whole thing.
-        bubble.style.background = 'transparent';
-        bubble.style.borderRadius = '0';
-        bubble.style.boxShadow = 'none';
-        bubble.style.overflow = 'visible';
-        bubble.style.padding = '0';
+        let frame = bubble.firstElementChild;
+        if (!frame || !frame.classList.contains('jmpTpBubble')) {
+            // Styled inline, after YouTube's seek preview: a hairline white
+            // frame around a rounded thumbnail with the time below, and no box
+            // around the whole thing.
+            bubble.style.background = 'transparent';
+            bubble.style.borderRadius = '0';
+            bubble.style.boxShadow = 'none';
+            bubble.style.overflow = 'visible';
+            bubble.style.padding = '0';
 
-        bubble.innerHTML =
-            '<div class="jmpTpBubble" style="display:flex;flex-direction:column;align-items:center;">' +
-                '<div class="jmpTpFrame" style="border:1px solid #fff;border-radius:9px;' +
-                    'overflow:hidden;line-height:0;">' +
-                    '<img class="jmpTpImage" src="' + thumbnail.dataUrl + '" alt="" ' +
-                        'style="display:block;width:' + width + 'px;height:' + height + 'px;' +
-                        'border-radius:8px;" />' +
-                '</div>' +
-                '<div class="jmpTpTime" style="margin-top:24px;color:#eee;font-size:1.05em;' +
-                    'font-weight:500;letter-spacing:0.01em;line-height:1.2;' +
-                    'text-shadow:0 1px 3px rgba(0,0,0,0.95);">' +
-                    formatTime(positionMs) + '</div>' +
-            '</div>';
+            bubble.innerHTML =
+                '<div class="jmpTpBubble" style="display:flex;flex-direction:column;align-items:center;">' +
+                    '<div class="jmpTpFrame" style="border:1px solid #fff;border-radius:9px;' +
+                        'overflow:hidden;line-height:0;">' +
+                        '<img class="jmpTpImage" alt="" ' +
+                            'style="display:block;border-radius:8px;" />' +
+                    '</div>' +
+                    '<div class="jmpTpTime" style="margin-top:24px;color:#eee;font-size:1.05em;' +
+                        'font-weight:500;letter-spacing:0.01em;line-height:1.2;' +
+                        'text-shadow:0 1px 3px rgba(0,0,0,0.95);"></div>' +
+                '</div>';
+
+            frame = bubble.firstElementChild;
+        }
+
+        // The bubble is rebuilt only once: replacing it on every pointer move
+        // would throw away the decoded frame and make the preview flicker,
+        // while swapping the src keeps the previous frame on screen until the
+        // new one is decoded.
+        const image = frame.querySelector('.jmpTpImage');
+        const time = frame.querySelector('.jmpTpTime');
+
+        if (image.getAttribute('src') !== thumbnail.dataUrl) {
+            image.setAttribute('src', thumbnail.dataUrl);
+        }
+
+        if (image.style.width !== width + 'px') {
+            image.style.width = width + 'px';
+            image.style.height = height + 'px';
+        }
+
+        const label = formatTime(positionMs);
+        if (time.textContent !== label) {
+            time.textContent = label;
+        }
 
         this.verifyImage(bubble, info);
 
         if (this.loggedRender !== info.cacheKey) {
             this.loggedRender = info.cacheKey;
             const style = window.getComputedStyle(bubble);
-            console.info(
+            this.debug(
                 'Trickplay Preview: rendered ' + width + 'x' + height + ' into a '
                 + Math.round(bubble.offsetWidth) + 'x' + Math.round(bubble.offsetHeight)
                 + ' bubble (display ' + style.display + ', visibility ' + style.visibility
@@ -604,8 +705,11 @@ class trickplayPlugin {
         for (let step = 1; step <= NEARBY_BUCKETS; ++step) {
             for (const offset of [step, -step]) {
                 const key = buckets.get(bucket + offset * info.interval);
-                if (key && this.cache.has(key)) {
-                    return this.cache.get(key);
+                if (key) {
+                    const thumbnail = this.lookupThumbnail(key);
+                    if (thumbnail) {
+                        return thumbnail;
+                    }
                 }
             }
         }
@@ -691,7 +795,8 @@ class trickplayPlugin {
             return;
         }
 
-        if (this.cache.has(key)) {
+        const cached = this.cache.get(key);
+        if (cached && cached.final !== false) {
             return;
         }
 
@@ -719,7 +824,7 @@ class trickplayPlugin {
                 return;
             }
 
-            console.info(`Trickplay Preview: no answer for ${Math.round(elapsed)}ms, retrying`);
+            this.debug(`Trickplay Preview: no answer for ${Math.round(elapsed)}ms, retrying`);
         }
 
         // The hovered frame wins over any queued background work.
@@ -733,7 +838,7 @@ class trickplayPlugin {
 
         if (this.loggedRequestItem !== info.cacheKey) {
             this.loggedRequestItem = info.cacheKey;
-            console.info('Trickplay Preview: requesting a frame at ' + formatTime(bucket));
+            this.debug('Trickplay Preview: requesting a frame at ' + formatTime(bucket));
         }
 
         this.lastRequestedKey = key;
@@ -766,7 +871,12 @@ class trickplayPlugin {
 
     requestHoveredThumbnail() {
         const hover = this.hover;
-        if (!hover || this.cache.has(hover.key)) {
+        if (!hover) {
+            return;
+        }
+
+        const cached = this.cache.get(hover.key);
+        if (cached && cached.final !== false) {
             return;
         }
 
@@ -777,18 +887,31 @@ class trickplayPlugin {
         this.requestThumbnail(hover.info, splitKey(hover.key).bucket, hover.key, false);
     }
 
-    onThumbnailReady(cacheKey, dataUrl, width, height) {
-        this.clearPending(cacheKey);
-        this.dropSupersededRequest(cacheKey);
+    onThumbnailReady(cacheKey, dataUrl, width, height, finalFrame) {
+        const final = finalFrame !== false;
 
-        this.storeThumbnail(cacheKey, { dataUrl, width, height });
+        this.storeThumbnail(cacheKey, { dataUrl, width, height, final });
 
         const { itemKey, bucket } = splitKey(cacheKey);
+        this.lastFrame = { itemKey, thumbnail: this.cache.get(cacheKey) };
+
+        // The frame at the keyframe before the position arrives first. The
+        // exact frame is still being generated, so the request stays pending
+        // and the background queue stays paused until it is delivered.
+        if (!final) {
+            if (this.hover?.key === cacheKey) {
+                this.refreshBubble();
+            }
+            return;
+        }
+
+        this.clearPending(cacheKey);
+        this.dropSupersededRequest();
+
         if (this.loggedItem !== itemKey) {
             this.loggedItem = itemKey;
-            console.info('Trickplay Preview: frames are being generated for this item');
+            this.debug('Trickplay Preview: frames are being generated for this item');
         }
-        this.lastFrame = { itemKey, thumbnail: this.cache.get(cacheKey) };
 
         const hover = this.hover;
         if (hover && hover.key === cacheKey) {
@@ -819,10 +942,10 @@ class trickplayPlugin {
         const failure = reason || 'unknown';
         if (!this.loggedFailures.has(failure)) {
             this.loggedFailures.add(failure);
-            console.info('Trickplay Preview: native preview failed: ' + failure);
+            console.warn('Trickplay Preview: native preview failed: ' + failure);
         }
         this.clearPending(cacheKey);
-        this.dropSupersededRequest(cacheKey);
+        this.dropSupersededRequest();
         if (this.lastRequestedKey === cacheKey) {
             this.lastRequestedKey = null;
         }
@@ -886,12 +1009,12 @@ class trickplayPlugin {
         if (!bubble.isConnected) {
             if (this.loggedSkip !== info.cacheKey) {
                 this.loggedSkip = info.cacheKey;
-                console.info('Trickplay Preview: frame ready but the bubble is detached');
+                this.debug('Trickplay Preview: frame ready but the bubble is detached');
             }
             return;
         }
 
-        const thumbnail = this.cache.get(key)
+        const thumbnail = this.lookupThumbnail(key)
             || this.findNearby(info, splitKey(key).bucket)
             || this.lastFrameThumbnail(info);
 
@@ -900,8 +1023,21 @@ class trickplayPlugin {
         }
     }
 
+    lookupThumbnail(key) {
+        const thumbnail = this.cache.get(key);
+        if (!thumbnail) {
+            return null;
+        }
+
+        // Re-insert so the least recently used frame is evicted first.
+        this.cache.delete(key);
+        this.cache.set(key, thumbnail);
+        return thumbnail;
+    }
+
     storeThumbnail(key, thumbnail) {
         const { itemKey, bucket } = splitKey(key);
+        this.cache.delete(key);
         this.cache.set(key, thumbnail);
 
         let buckets = this.bucketsByItem.get(itemKey);

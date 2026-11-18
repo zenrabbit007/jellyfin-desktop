@@ -30,10 +30,19 @@ public:
 
 public Q_SLOTS:
   void generate(quint64 id, const QString& url, qint64 positionMs, int width, const QString& cacheKey);
+
+  /// Loads url ahead of the first preview so the first hover only pays for a
+  /// seek. Safe to call for the stream that is already playing.
+  void prepare(const QString& url);
+
   void shutdown();
 
 Q_SIGNALS:
-  void ready(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height);
+  /// finalFrame is false for the frame at the keyframe before the requested
+  /// position, which is delivered first so a preview appears within ~50ms, and
+  /// true for the frame at the requested position.
+  void ready(quint64 id, const QString& cacheKey, const QString& dataUrl, int width, int height,
+             bool finalFrame);
   void failed(quint64 id, const QString& cacheKey, const QString& error);
 
 private:
@@ -41,15 +50,25 @@ private:
     QString dataUrl;
     int width = 0;
     int height = 0;
+    bool finalFrame = false;
+  };
+
+  enum class SeekMode {
+    Keyframe,
+    Exact
   };
 
   bool initializeMpv(QString& error);
   bool loadUrl(quint64 id, const QString& url, QString& error);
-  bool seekAndCapture(quint64 id, qint64 positionMs, QByteArray& jpeg, int& width, int& height, QString& error);
+  bool seekAndCapture(quint64 id, qint64 positionMs, SeekMode mode, QByteArray& jpeg, int& width,
+                      int& height, QString& error);
   bool waitForIdle(quint64 id, int timeoutMs);
   QByteArray takeRenderedFrame(int& width, int& height) const;
+  double currentPositionSeconds() const;
   bool applyScale(int width);
   bool isCancelled(quint64 id) const;
+  void deliver(quint64 id, const QString& cacheKey, const QByteArray& jpeg, int width, int height,
+               bool finalFrame);
   void drainEvents();
   void cleanupFiles();
   int runCommand(const QStringList& args);
