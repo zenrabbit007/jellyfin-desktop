@@ -789,7 +789,9 @@
                     player.videoPlaybackActive.connect((active) => console.log(`[MPV Signal] videoPlaybackActive: ${active}`));
                     player.windowVisible.connect((visible) => console.log(`[MPV Signal] windowVisible: ${visible}`));
                     player.onVideoRecangleChanged.connect(() => console.log('[MPV Signal] onVideoRecangleChanged'));
-                    player.onMetaData.connect((meta) => console.log(`[MPV Signal] onMetaData: ${JSON.stringify(meta)}`));
+                    // The payload carries the item's name, its path on the server and
+                    // the user's play state, so only the signal itself is logged.
+                    player.onMetaData.connect(() => console.log('[MPV Signal] onMetaData'));
                 }
 
                 if (options.fullscreen) {
