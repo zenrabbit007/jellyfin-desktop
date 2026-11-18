@@ -36,6 +36,22 @@ execute_process(
 function(fix_lib_dependencies lib framework_libs_var)
   set(framework_libs ${${framework_libs_var}})
 
+  # otool -D prints the library's own install name, and otool -L then repeats it
+  # as its first entry. Bundles and plugins have none.
+  execute_process(
+    COMMAND otool -D "${lib}"
+    OUTPUT_VARIABLE otool_id
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  set(own_id "")
+  string(REPLACE "\n" ";" otool_id_lines "${otool_id}")
+  list(LENGTH otool_id_lines otool_id_count)
+  if(otool_id_count GREATER 1)
+    list(GET otool_id_lines 1 own_id)
+    string(STRIP "${own_id}" own_id)
+  endif()
+
   execute_process(
     COMMAND otool -L "${lib}"
     OUTPUT_VARIABLE otool_output
@@ -68,6 +84,22 @@ function(fix_lib_dependencies lib framework_libs_var)
       # Extract dependency path (remove compatibility version suffix)
       string(REGEX REPLACE " \\(compatibility.*$" "" dependency_str "${line}")
       string(STRIP "${dependency_str}" dependency_str)
+
+      # A flat library in Frameworks that records a Homebrew path as its own
+      # install name keeps that path: -change below would only add a self
+      # reference, so the build machine's path stays baked into the bundle and
+      # a dependent that asks for it through @rpath cannot find it on another
+      # Mac. Rewrite the ID itself.
+      get_filename_component(lib_dir "${lib}" DIRECTORY)
+      if(own_id AND dependency_str STREQUAL own_id
+         AND dependency_str MATCHES "^(/usr/local|/opt/homebrew)"
+         AND lib_dir STREQUAL framework_path)
+        get_filename_component(own_name "${lib}" NAME)
+        set(target "@executable_path/../Frameworks/${own_name}")
+        message(STATUS "Fixing own install name ${dependency_str} -> ${target}")
+        execute_process(COMMAND install_name_tool -id "${target}" "${lib}" ERROR_QUIET)
+        continue()
+      endif()
 
       # Resolve the actual path
       if(dependency_str MATCHES "^@rpath/(.+)")
@@ -229,6 +261,43 @@ while(iteration LESS max_iterations)
 endwhile()
 
 message(STATUS "Library path fixing complete")
+
+#
+# Plugins that can never load. macdeployqt copies the plugins of every Qt module
+# it bundles, and one of them can be linked against a client library that is
+# installed on the build machine: Qt's PostgreSQL driver links against whatever
+# libpq is installed (Postgres.app, for example). Such a plugin cannot work on
+# another Mac and only bakes a build-machine path into the bundle. The remaining
+# drivers are kept because Qt's LocalStorage uses them.
+#
+file(GLOB_RECURSE plugin_binaries "${app}/Contents/PlugIns/*.dylib" "${app}/Contents/PlugIns/*.so")
+foreach(plugin ${plugin_binaries})
+  execute_process(
+    COMMAND otool -L "${plugin}"
+    OUTPUT_VARIABLE plugin_otool
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  string(REPLACE "\n" ";" plugin_lines "${plugin_otool}")
+
+  foreach(line ${plugin_lines})
+    # otool prints one header line per architecture; only the indented lines
+    # are dependencies.
+    if(NOT line MATCHES "^\t")
+      continue()
+    endif()
+
+    string(STRIP "${line}" line)
+    string(REGEX REPLACE " \\(compatibility.*$" "" plugin_dep "${line}")
+
+    if(plugin_dep MATCHES "^(/usr/local/|/opt/homebrew/|/Applications/|/Users/[^/]+/)"
+       AND NOT plugin_dep MATCHES "\\.framework/")
+      message(STATUS "Removing ${plugin}: it needs ${plugin_dep}, which is not in the bundle")
+      file(REMOVE "${plugin}")
+      break()
+    endif()
+  endforeach()
+endforeach()
 
 #
 # sdl2-compat: Homebrew's sdl2 formula is now a compatibility layer that loads
