@@ -194,8 +194,15 @@ bool TrickplayWorker::ensureTempDir()
   // Only this user may read the frames of the media being previewed. mpv
   // creates the files themselves with the default umask, which is harmless
   // inside a directory nobody else can enter.
+#ifdef Q_OS_WIN
+  // Windows has no POSIX permission bits, so there is nothing to narrow here:
+  // the directory inherits the ACL of the per-user temporary directory, which
+  // is what keeps the frames private.
+  return true;
+#else
   return QFile::setPermissions(m_tempDir, QFileDevice::ReadOwner | QFileDevice::WriteOwner
                                            | QFileDevice::ExeOwner);
+#endif
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

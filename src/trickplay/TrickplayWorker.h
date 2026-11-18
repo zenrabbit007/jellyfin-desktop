@@ -19,7 +19,8 @@
 ///
 /// The image VO can only hand out a frame as a file, so each capture writes one
 /// JPEG into a private temporary directory. That file is deleted as soon as it
-/// has been read, and the directory is only readable by the current user.
+/// has been read, and the directory is only readable by the current user (on
+/// Windows, where there are no permission bits, %TEMP% is per-user).
 class TrickplayWorker : public QObject
 {
   Q_OBJECT

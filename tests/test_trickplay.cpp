@@ -366,11 +366,15 @@ void TestTrickplay::testTempDirStaysPrivate()
 
   // A capture writes a frame of the video being watched, so nobody else may
   // read it and nothing may be left behind once it has been handed over.
+#ifndef Q_OS_WIN
+  // Windows has no POSIX permission bits to check; the directory is private
+  // because %TEMP% is per-user, which a test cannot assert here.
   const QFile::Permissions permissions = QFileInfo(dir).permissions();
   const QFile::Permissions shared = QFileDevice::ReadGroup | QFileDevice::WriteGroup
     | QFileDevice::ExeGroup | QFileDevice::ReadOther | QFileDevice::WriteOther
     | QFileDevice::ExeOther;
   QVERIFY2(!(permissions & shared), "The preview directory is readable by other users");
+#endif
 
   QCOMPARE(QDir(dir).entryList(QDir::Files | QDir::NoDotAndDotDot), QStringList());
 }
@@ -400,5 +404,5 @@ void TestTrickplay::testComponentDeliversThumbnail()
   QCOMPARE(args.at(3).toInt(), 90);
 }
 
-QTEST_MAIN(TestTrickplay)
+QTEST_GUILESS_MAIN(TestTrickplay)
 #include "test_trickplay.moc"
