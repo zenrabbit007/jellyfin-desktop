@@ -48,20 +48,25 @@ function isPreviewEnabled() {
     return window.jmpInfo?.settings?.video?.trickplay_preview !== false;
 }
 
-function preferServerTrickplay() {
+function previewSource() {
     const settings = window.jmpInfo?.settings?.video;
-    if (settings?.prefer_server_trickplay === false) {
-        return false;
+    const source = settings?.preview_source;
+    if (source === 'auto' || source === 'server' || source === 'client') {
+        return source;
     }
 
-    // Never trade a working local preview for a broken tile set.
-    return isPreviewEnabled();
+    // Profiles from before the source became selectable only had a boolean.
+    return settings?.prefer_server_trickplay === false ? 'client' : 'auto';
 }
 
-function preferServerFrames() {
-    // Frames are only a different way of getting the server's trickplay images,
-    // so the same setting decides whether they are used.
-    return preferServerTrickplay();
+function allowServerImages() {
+    // 'client' means the player extracts the frames, no matter what the server has.
+    return isPreviewEnabled() && previewSource() !== 'client';
+}
+
+function allowPlayerFrames() {
+    // 'server' is a deliberate choice to never touch the playing stream.
+    return isPreviewEnabled() && previewSource() !== 'server';
 }
 
 function previewTranscoded() {
@@ -478,6 +483,14 @@ class trickplayPlugin {
             return true;
         }
 
+        if (!allowPlayerFrames()) {
+            // The user asked for server images only and this item has none.
+            if (this.hover || this.prefetchQueue.length || this.hoverTimer !== undefined) {
+                this.stopPreviewing(bubble);
+            }
+            return false;
+        }
+
         if (info.hls && !previewTranscoded()) {
             // Seeking an HLS stream pulls whole segments, lands on the wrong
             // frame and cannot be cancelled cheaply.
@@ -534,7 +547,7 @@ class trickplayPlugin {
     }
 
     showServerFrame(info, bubble, slider, positionMs, value) {
-        if (!preferServerFrames() || this.frameUnsupported.has(info.cacheKey)) {
+        if (!allowServerImages() || this.frameUnsupported.has(info.cacheKey)) {
             return false;
         }
 
@@ -661,7 +674,7 @@ class trickplayPlugin {
     }
 
     useServerFrames(info, bubble) {
-        if (!preferServerTrickplay() || !hasUsableTrickplay(info.item?.Trickplay, info.mediaSourceId)) {
+        if (!allowServerImages() || !hasUsableTrickplay(info.item?.Trickplay, info.mediaSourceId)) {
             return false;
         }
 

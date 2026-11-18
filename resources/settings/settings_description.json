@@ -355,10 +355,20 @@
         "default": true
       },
       {
+        "value": "preview_source",
+        "display_name": "Seek Bar Preview Source",
+        "help": "Where the image for the seek bar tooltip comes from.\n\n- Server, then the player: the frame the server extracts on demand, its trickplay tiles when it has those, and otherwise a frame extracted from the playing stream. This needs the least bandwidth and also works while transcoding.\n- Server only: never seek the playing stream, so items the server has no images for show no preview.\n- Player only: always extract the frame from the playing stream, which needs a seek and more bandwidth.",
+        "default": "auto",
+        "possible_values": [
+          [ "auto", "Server, then the player" ],
+          [ "server", "Server only" ],
+          [ "client", "Player only" ]
+        ]
+      },
+      {
         "value": "prefer_server_trickplay",
-        "display_name": "Prefer Server Trickplay",
-        "help": "Uses the images the server generates for an item instead of extracting frames from the stream: a single on demand frame per position when the server supports it, or the trickplay tiles it already has. This needs far less bandwidth than seeking the stream. Frames extracted from the stream are only used for items the server has no trickplay images for.",
-        "default": true
+        "default": true,
+        "hidden": true
       },
       {
         "value": "prefer_transcode_to_h265",
