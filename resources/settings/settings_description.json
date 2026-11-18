@@ -351,13 +351,13 @@
       {
         "value": "trickplay_preview",
         "display_name": "Seek Bar Previews",
-        "help": "Shows a frame of the video in the seek bar tooltip while hovering or dragging it. The frames are generated on the fly from the stream that is playing, so no server-side trickplay task is needed. Disable this if the previews are slow or cause playback problems.",
+        "help": "Shows a frame of the video in the seek bar tooltip while hovering or dragging it. The image comes from the server when it can provide one and is extracted from the playing stream otherwise, so no scheduled trickplay task is needed. Disable this if the previews are slow or cause playback problems.",
         "default": true
       },
       {
         "value": "prefer_server_trickplay",
         "display_name": "Prefer Server Trickplay",
-        "help": "Uses the trickplay images the server already has for an item instead of extracting frames from the stream, which needs far less bandwidth. The on-the-fly frames are used for items the server has no trickplay images for.",
+        "help": "Uses the images the server generates for an item instead of extracting frames from the stream: a single on demand frame per position when the server supports it, or the trickplay tiles it already has. This needs far less bandwidth than seeking the stream. Frames extracted from the stream are only used for items the server has no trickplay images for.",
         "default": true
       },
       {
