@@ -1,9 +1,11 @@
 (function() {
-// Replaces the trickplay images in the video OSD with frames that are extracted
-// on demand from the stream by the native player. This is the fallback: when
-// the server already knows the trickplay layout of an item, its tiles are used
-// instead -- one tile download covers a whole window of the timeline, while
-// every native frame costs a seek of the video stream.
+// Replaces the trickplay images in the video OSD with images that are generated
+// on demand. Preference order:
+//   1. the server's single frame endpoint (no tile is written, one small jpeg
+//      per hovered position),
+//   2. the server's trickplay tiles, rendered by the client,
+//   3. frames extracted from the stream by the native player, which is the
+//      fallback because every frame costs a seek of the video stream.
 const REQUEST_WIDTH = 400;
 const BUBBLE_MAX_WIDTH = 320;
 const BUBBLE_MAX_HEIGHT = 220;
@@ -17,6 +19,9 @@ const PREFETCH_DELAY_MS = 350;
 // Sweeping the seek bar crosses many buckets. Waiting for the pointer to slow
 // down turns that into one or two seeks instead of one per bucket.
 const HOVER_REQUEST_DELAY_MS = 120;
+// Same reasoning for the server frames: a sweep across the bar would otherwise
+// ask the server to extract a frame for every bucket it passes.
+const FRAME_HOVER_DELAY_MS = 120;
 // The worker answers every request it receives, but a lost answer must not block
 // previews for good. This has to stay above the worker's own load + seek budget
 // (30s + 15s), otherwise big/slow files get superseded while they are still
@@ -53,6 +58,12 @@ function preferServerTrickplay() {
     return isPreviewEnabled();
 }
 
+function preferServerFrames() {
+    // Frames are only a different way of getting the server's trickplay images,
+    // so the same setting decides whether they are used.
+    return preferServerTrickplay();
+}
+
 function previewTranscoded() {
     // Seeking an HLS stream pulls whole segments, lands on the wrong frame and
     // cannot be cancelled cheaply, so previews stay off unless asked for.
@@ -86,6 +97,40 @@ function hasUsableTrickplay(manifest, mediaSourceId) {
         && info.TileHeight > 0
         && info.Interval > 0
         && info.ThumbnailCount > 0);
+}
+
+function getServerApi(item) {
+    const connections = window.ServerConnections;
+    if (connections && typeof connections.getApi === 'function' && item?.ServerId) {
+        const api = connections.getApi(item.ServerId);
+        if (api) {
+            return api;
+        }
+    }
+
+    return window.ApiClient || null;
+}
+
+function pickFrameInfo(manifest, mediaSourceId) {
+    const resolutions = manifest && typeof manifest === 'object' ? manifest[mediaSourceId] : null;
+    if (!resolutions || typeof resolutions !== 'object') {
+        return null;
+    }
+
+    let best = null;
+    for (const info of Object.values(resolutions)) {
+        if (!info || !(info.Width > 0) || !(info.Height > 0) || !(info.Interval > 0)) {
+            continue;
+        }
+
+        // The bubble is BUBBLE_MAX_WIDTH wide, a frame wider than that only
+        // costs bandwidth.
+        if (!best || Math.abs(info.Width - BUBBLE_MAX_WIDTH) < Math.abs(best.Width - BUBBLE_MAX_WIDTH)) {
+            best = info;
+        }
+    }
+
+    return best;
 }
 
 function splitKey(key) {
@@ -158,6 +203,10 @@ class trickplayPlugin {
         this.loggedServerUnused = null;
         this.loggedDisabled = false;
         this.loggedBadValue = false;
+        this.frameTimer = undefined;
+        this.frameCache = new Set();
+        this.frameUnsupported = new Set();
+        this.loggedFrameItem = null;
 
         document.addEventListener('viewshow', () => this.schedulePatch(), true);
         document.addEventListener('DOMContentLoaded', () => this.schedulePatch(), { once: true });
@@ -349,11 +398,6 @@ class trickplayPlugin {
             return null;
         }
 
-        if (!previewTranscoded() && isHlsPlayback(state, url)) {
-            this.noPreviewReason = 'transcoded playback';
-            return null;
-        }
-
         this.noPreviewReason = null;
 
         const mediaSourceId = state.MediaSource?.Id || item.Id;
@@ -368,6 +412,9 @@ class trickplayPlugin {
             mediaSourceId,
             interval,
             durationMs,
+            // Only the native preview cares: it would have to seek the playing
+            // stream. Images that the server extracts come from the source file.
+            hls: isHlsPlayback(state, url),
             cacheKey: (item.ServerId || '') + '|' + item.Id + '|' + mediaSourceId
         };
     }
@@ -399,7 +446,21 @@ class trickplayPlugin {
             return false;
         }
 
-        this.warnedNoInfo = false;
+        const positionMs = info.durationMs * value / 100;
+        if (!Number.isFinite(positionMs) || positionMs < 0) {
+            if (!this.loggedBadValue) {
+                this.loggedBadValue = true;
+                console.info('Trickplay Preview: unusable slider value ' + value
+                    + ' (duration ' + info.durationMs + ' ms)');
+            }
+            return false;
+        }
+
+        this.loggedBadValue = false;
+
+        if (this.showServerFrame(info, bubble, slider, positionMs, value)) {
+            return true;
+        }
 
         if (this.useServerFrames(info, bubble)) {
             // The client's own handler already rendered the server tile before
@@ -417,22 +478,26 @@ class trickplayPlugin {
             return true;
         }
 
-        if (this.loggedHookItem !== info.cacheKey) {
-            this.loggedHookItem = info.cacheKey;
-            console.info('Trickplay Preview: hook is active for item ' + info.item.Id);
-        }
+        if (info.hls && !previewTranscoded()) {
+            // Seeking an HLS stream pulls whole segments, lands on the wrong
+            // frame and cannot be cancelled cheaply.
+            if (!this.warnedNoInfo) {
+                this.warnedNoInfo = true;
+                console.info('Trickplay Preview: nothing to preview (transcoded playback)');
+            }
 
-        const positionMs = info.durationMs * value / 100;
-        if (!Number.isFinite(positionMs) || positionMs < 0) {
-            if (!this.loggedBadValue) {
-                this.loggedBadValue = true;
-                console.info('Trickplay Preview: unusable slider value ' + value
-                    + ' (duration ' + info.durationMs + ' ms)');
+            if (this.hover || this.prefetchQueue.length || this.hoverTimer !== undefined) {
+                this.stopPreviewing(bubble);
             }
             return false;
         }
 
-        this.loggedBadValue = false;
+        this.warnedNoInfo = false;
+
+        if (this.loggedHookItem !== info.cacheKey) {
+            this.loggedHookItem = info.cacheKey;
+            console.info('Trickplay Preview: hook is active for item ' + info.item.Id);
+        }
 
         const bucket = Math.floor(positionMs / info.interval) * info.interval;
 
@@ -466,6 +531,133 @@ class trickplayPlugin {
 
         this.scheduleHoverRequest(info, bucket, key);
         return true;
+    }
+
+    showServerFrame(info, bubble, slider, positionMs, value) {
+        if (!preferServerFrames() || this.frameUnsupported.has(info.cacheKey)) {
+            return false;
+        }
+
+        const frameInfo = pickFrameInfo(info.item?.Trickplay, info.mediaSourceId);
+        const api = getServerApi(info.item);
+        if (!frameInfo || !api) {
+            return false;
+        }
+
+        // Snap to the frame the server keeps, so that moving the pointer within
+        // one interval re-uses the image the browser already has.
+        const bucket = Math.floor(positionMs / frameInfo.Interval) * frameInfo.Interval;
+        const url = this.buildFrameUrl(api, info, frameInfo, bucket);
+        if (!url) {
+            return false;
+        }
+
+        const key = info.cacheKey + '|frame|' + bucket;
+
+        if (this.hover?.frame !== true || this.hover.info.cacheKey !== info.cacheKey) {
+            // Drop whatever the native worker was doing, it would only compete
+            // with the server for the same frames.
+            this.stopPreviewing(bubble);
+        }
+
+        this.hover = { bubble, info, slider, positionMs, key, frame: true };
+
+        if (this.loggedFrameItem !== info.cacheKey) {
+            this.loggedFrameItem = info.cacheKey;
+            console.info('Trickplay Preview: using on demand server frames for item ' + info.item.Id);
+        }
+
+        // Never replace a tile the client already rendered with the plain
+        // tooltip, it is a better placeholder than the time text.
+        const clientTile = bubble?.querySelector?.('.chapterThumbWrapper');
+        const showsTile = Boolean(clientTile && String(clientTile.style.backgroundImage).includes('/Trickplay/'));
+
+        this.resetBubbleStyles(bubble);
+
+        if (this.frameCache.has(url)) {
+            this.renderServerFrame(bubble, slider, info, positionMs, url, frameInfo);
+            return true;
+        }
+
+        // Keep the client's tooltip while the pointer moves, and only ask the
+        // server once it settled.
+        if (!showsTile) {
+            this.renderDefaultBubble(slider, bubble, value, positionMs);
+        }
+
+        this.cancelFrameTimer();
+        this.frameTimer = window.setTimeout(() => {
+            this.frameTimer = undefined;
+
+            if (!this.hover || this.hover.key !== key || this.hover.bubble !== bubble || !bubble.isConnected) {
+                return;
+            }
+
+            this.renderServerFrame(bubble, slider, info, positionMs, url, frameInfo);
+        }, FRAME_HOVER_DELAY_MS);
+
+        return true;
+    }
+
+    buildFrameUrl(api, info, frameInfo, bucket) {
+        const params = {
+            positionTicks: bucket * 10000,
+            MediaSourceId: info.mediaSourceId,
+            ApiKey: typeof api.accessToken === 'function' ? api.accessToken() : undefined
+        };
+        const path = 'Videos/' + info.item.Id + '/Trickplay/' + frameInfo.Width + '/frame.jpg';
+
+        try {
+            if (typeof api.getUri === 'function') {
+                return api.getUri(path, params);
+            }
+
+            if (typeof api.getUrl === 'function') {
+                const query = Object.entries(params)
+                    .filter(([, paramValue]) => paramValue !== undefined)
+                    .map(([name, paramValue]) => encodeURIComponent(name) + '=' + encodeURIComponent(paramValue))
+                    .join('&');
+                return api.getUrl(path) + '?' + query;
+            }
+        } catch (error) {
+            console.error('Trickplay Preview: could not build the frame url', error);
+        }
+
+        return null;
+    }
+
+    renderServerFrame(bubble, slider, info, positionMs, url, frameInfo) {
+        this.renderThumbnail(slider, bubble, info, positionMs, {
+            src: url,
+            width: frameInfo.Width,
+            height: frameInfo.Height
+        });
+
+        const image = bubble.querySelector('.jmpTpImage');
+        if (!image) {
+            return;
+        }
+
+        image.addEventListener('load', () => {
+            if (this.frameCache.size > 2000) {
+                this.frameCache.clear();
+            }
+            this.frameCache.add(url);
+        }, { once: true });
+        image.addEventListener('error', () => this.onServerFrameFailed(info, slider, bubble, positionMs), { once: true });
+    }
+
+    onServerFrameFailed(info, slider, bubble, positionMs) {
+        // The server is either too old for this endpoint or has the on demand
+        // frame extraction turned off: stop asking for this item and let the
+        // tiles or the native preview handle it.
+        this.frameUnsupported.add(info.cacheKey);
+        this.hover = null;
+        this.resetBubbleStyles(bubble);
+        console.info('Trickplay Preview: the server returned no frame, falling back');
+
+        const value = info.durationMs > 0 ? positionMs / info.durationMs * 100 : 0;
+        this.onSliderBubbleUpdate(slider, bubble, value);
     }
 
     useServerFrames(info, bubble) {
@@ -505,6 +697,13 @@ class trickplayPlugin {
         if (this.hoverTimer !== undefined) {
             window.clearTimeout(this.hoverTimer);
             this.hoverTimer = undefined;
+        }
+    }
+
+    cancelFrameTimer() {
+        if (this.frameTimer !== undefined) {
+            window.clearTimeout(this.frameTimer);
+            this.frameTimer = undefined;
         }
     }
 
@@ -565,7 +764,7 @@ class trickplayPlugin {
             '<div class="jmpTpBubble" style="display:flex;flex-direction:column;align-items:center;">' +
                 '<div class="jmpTpFrame" style="border:1px solid #fff;border-radius:9px;' +
                     'overflow:hidden;line-height:0;">' +
-                    '<img class="jmpTpImage" src="' + thumbnail.dataUrl + '" alt="" ' +
+                    '<img class="jmpTpImage" src="' + (thumbnail.src || thumbnail.dataUrl) + '" alt="" ' +
                         'style="display:block;width:' + width + 'px;height:' + height + 'px;' +
                         'border-radius:8px;" />' +
                 '</div>' +
@@ -766,7 +965,7 @@ class trickplayPlugin {
 
     requestHoveredThumbnail() {
         const hover = this.hover;
-        if (!hover || this.cache.has(hover.key)) {
+        if (!hover || hover.frame || this.cache.has(hover.key)) {
             return;
         }
 
@@ -844,6 +1043,7 @@ class trickplayPlugin {
         this.prefetchQueue = [];
         this.cancelPrefetchTimer();
         this.cancelHoverRequest();
+        this.cancelFrameTimer();
         this.inFlight = null;
         this.lastRequestedKey = null;
 
@@ -878,7 +1078,7 @@ class trickplayPlugin {
 
     refreshBubble() {
         const hover = this.hover;
-        if (!hover) {
+        if (!hover || hover.frame) {
             return;
         }
 
