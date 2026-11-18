@@ -15,6 +15,10 @@
 /// A dedicated, invisible mpv instance is kept on a worker thread. It loads the
 /// media URL used by the real player, seeks to the requested position and grabs
 /// a JPEG screenshot. Results are cached in memory per cache key.
+///
+/// The image VO can only hand out a frame as a file, so each capture writes one
+/// JPEG into a private temporary directory. That file is deleted as soon as it
+/// has been read, and the directory is only readable by the current user.
 class TrickplayWorker : public QObject
 {
   Q_OBJECT
@@ -59,6 +63,7 @@ private:
   };
 
   bool initializeMpv(QString& error);
+  bool ensureTempDir();
   bool loadUrl(quint64 id, const QString& url, QString& error);
   bool seekAndCapture(quint64 id, qint64 positionMs, SeekMode mode, QByteArray& jpeg, int& width,
                       int& height, QString& error);
@@ -73,6 +78,7 @@ private:
   void cleanupFiles();
   int runCommand(const QStringList& args);
   static QString normalizeUrl(const QString& url);
+  static void removeStaleTempDirs(const QString& ownDir);
 
   mpv_handle* m_mpv = nullptr;
   bool m_ignoreSslErrors = false;

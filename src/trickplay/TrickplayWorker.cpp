@@ -16,6 +16,10 @@ namespace {
 constexpr int kLoadTimeoutMs = 30000;
 constexpr int kSeekTimeoutMs = 15000;
 constexpr int kSettleTimeoutMs = 1000;
+// The image VO signals a rendered frame by writing a file, so the frame is
+// detected one poll late. A short poll keeps that below a frame time.
+constexpr double kFramePollSeconds = 0.002;
+constexpr int kStaleTempDirHours = 1;
 constexpr int kCacheEntries = 500;
 // A keyframe seek lands on the previous keyframe, which is exactly the
 // requested frame when the two are this close. Anything further away gets the
@@ -145,6 +149,45 @@ void TrickplayWorker::cleanupFiles()
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+void TrickplayWorker::removeStaleTempDirs(const QString& ownDir)
+{
+  // A capture writes a frame of the video being watched, so a directory left
+  // behind by a process that was killed must not stay there. Directories of
+  // other running instances are left alone; ours is excluded explicitly.
+  QDir temp(QDir::tempPath());
+  const QStringList candidates = temp.entryList({ QStringLiteral("jellyfin-desktop-trickplay-*") },
+                                                QDir::Dirs | QDir::NoDotAndDotDot);
+
+  for (const QString& name : candidates) {
+    const QString path = temp.filePath(name);
+    if (QDir(path).absolutePath() == QDir(ownDir).absolutePath())
+      continue;
+
+    const QDateTime modified = QFileInfo(path).lastModified();
+    if (modified.isValid() && modified.secsTo(QDateTime::currentDateTime()) > kStaleTempDirHours * 3600)
+      QDir(path).removeRecursively();
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+bool TrickplayWorker::ensureTempDir()
+{
+  if (m_tempDir.isEmpty())
+    return false;
+
+  removeStaleTempDirs(m_tempDir);
+
+  if (!QDir().mkpath(m_tempDir))
+    return false;
+
+  // Only this user may read the frames of the media being previewed. mpv
+  // creates the files themselves with the default umask, which is harmless
+  // inside a directory nobody else can enter.
+  return QFile::setPermissions(m_tempDir, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                           | QFileDevice::ExeOwner);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 bool TrickplayWorker::initializeMpv(QString& error)
 {
   if (m_mpv)
@@ -155,13 +198,11 @@ bool TrickplayWorker::initializeMpv(QString& error)
     return false;
   }
 
-  if (!QDir().mkpath(m_tempDir)) {
+  if (!ensureTempDir()) {
     m_initFailed = true;
     error = tr("Could not create trickplay temporary directory");
     return false;
   }
-
-  cleanupFiles();
 
   mpv_handle* mpv = mpv_create();
   if (!mpv) {
@@ -395,6 +436,11 @@ bool TrickplayWorker::seekAndCapture(quint64 id, qint64 positionMs, SeekMode mod
   if (!waitForIdle(id, kSettleTimeoutMs))
     return false;
 
+  // The directory can disappear under us (a temp cleaner, or a later version
+  // of this code); mpv would then fail to write the frame.
+  if (!QDir(m_tempDir).exists() && !ensureTempDir())
+    return false;
+
   cleanupFiles();
   drainEvents();
 
@@ -421,7 +467,7 @@ bool TrickplayWorker::seekAndCapture(quint64 id, qint64 positionMs, SeekMode mod
     if (isCancelled(id))
       return false;
 
-    mpv_event* event = mpv_wait_event(m_mpv, 0.02);
+    mpv_event* event = mpv_wait_event(m_mpv, kFramePollSeconds);
     if (event && event->event_id == MPV_EVENT_END_FILE) {
       // Seeking at the very end of the file can unload it. Do not retry, the
       // caller will simply not show a preview for this position.
@@ -430,8 +476,11 @@ bool TrickplayWorker::seekAndCapture(quint64 id, qint64 positionMs, SeekMode mod
     }
 
     jpeg = takeRenderedFrame(width, height);
-    if (!jpeg.isEmpty())
+    if (!jpeg.isEmpty()) {
+      // The frame is in memory now; nothing of the video stays behind on disk.
+      cleanupFiles();
       return true;
+    }
   }
 
   error = tr("Timed out rendering trickplay frame");

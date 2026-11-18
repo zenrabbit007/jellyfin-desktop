@@ -1,5 +1,7 @@
 #include <QtTest/QtTest>
 
+#include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QColor>
 #include <QImage>
@@ -69,6 +71,7 @@ private slots:
   void testFrameMatchesRequestedPosition();
   void testMissingMediaFails();
   void testKeyframeFrameArrivesFirst();
+  void testTempDirStaysPrivate();
   void testComponentDeliversThumbnail();
 };
 
@@ -241,6 +244,33 @@ void TestTrickplay::testKeyframeFrameArrivesFirst()
   const QImage exact = decodeThumbnail(readySpy.at(1).at(2).toString());
   QCOMPARE(fast.size(), QSize(160, 90));
   QCOMPARE(exact.size(), QSize(160, 90));
+}
+
+void TestTrickplay::testTempDirStaysPrivate()
+{
+  const QString media = QFINDTESTDATA("data/trickplay.mp4");
+  QVERIFY2(!media.isEmpty(), "Test video not found");
+
+  TrickplayWorker worker(false, QString(), QString());
+  QSignalSpy readySpy(&worker, &TrickplayWorker::ready);
+
+  worker.setLatestRequest(1);
+  worker.generate(1, media, 500, 160, QStringLiteral("private|1"));
+  QVERIFY(!frameAtRequestedPosition(readySpy).isEmpty());
+
+  const QString dir = QDir(QDir::tempPath())
+                        .filePath(QStringLiteral("jellyfin-desktop-trickplay-%1")
+                                    .arg(QCoreApplication::applicationPid()));
+
+  // A capture writes a frame of the video being watched, so nobody else may
+  // read it and nothing may be left behind once it has been handed over.
+  const QFile::Permissions permissions = QFileInfo(dir).permissions();
+  const QFile::Permissions shared = QFileDevice::ReadGroup | QFileDevice::WriteGroup
+    | QFileDevice::ExeGroup | QFileDevice::ReadOther | QFileDevice::WriteOther
+    | QFileDevice::ExeOther;
+  QVERIFY2(!(permissions & shared), "The preview directory is readable by other users");
+
+  QCOMPARE(QDir(dir).entryList(QDir::Files | QDir::NoDotAndDotDot), QStringList());
 }
 
 void TestTrickplay::testComponentDeliversThumbnail()
