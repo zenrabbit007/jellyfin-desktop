@@ -72,6 +72,7 @@ private slots:
   void testMissingMediaFails();
   void testKeyframeFrameArrivesFirst();
   void testSpeculativeRequestStopsAtTheKeyframe();
+  void testRefineReusesTheCachedKeyframeFrame();
   void testBrokenStreamIsRememberedPerUrl();
   void testTempDirStaysPrivate();
   void testComponentDeliversThumbnail();
@@ -290,8 +291,36 @@ void TestTrickplay::testSpeculativeRequestStopsAtTheKeyframe()
   QCOMPARE(exact.at(6).toLongLong(), 2500LL);
 }
 
-void TestTrickplay::testBrokenStreamIsRememberedPerUrl()
+void TestTrickplay::testRefineReusesTheCachedKeyframeFrame()
 {
+  const QString media = QFINDTESTDATA("data/trickplay.mp4");
+  QVERIFY2(!media.isEmpty(), "Test video not found");
+
+  TrickplayWorker worker(false, QString(), QString());
+  QSignalSpy readySpy(&worker, &TrickplayWorker::ready);
+  QSignalSpy failedSpy(&worker, &TrickplayWorker::failed);
+
+  // The seek bar asks for the cheap frame first and only refines it once the
+  // pointer rests, so the refine arrives for a key that is already cached.
+  worker.setLatestRequest(1);
+  worker.generate(1, media, 2500, 160, QStringLiteral("refine|1"), false);
+  QCOMPARE(failedSpy.count(), 0);
+  QCOMPARE(readySpy.count(), 1);
+  QCOMPARE(readySpy.at(0).at(5).toBool(), false);
+
+  readySpy.clear();
+  worker.setLatestRequest(2);
+  worker.generate(2, media, 2500, 160, QStringLiteral("refine|1"), true);
+
+  // The exact frame is the only answer: repeating the keyframe seek would pay
+  // for the decode the cached frame already came from.
+  QCOMPARE(failedSpy.count(), 0);
+  QCOMPARE(readySpy.count(), 1);
+  QCOMPARE(readySpy.at(0).at(5).toBool(), true);
+  QCOMPARE(readySpy.at(0).at(6).toLongLong(), 2500LL);
+}
+
+void TestTrickplay::testBrokenStreamIsRememberedPerUrl(){
   const QString media = QFINDTESTDATA("data/trickplay.mp4");
   QVERIFY2(!media.isEmpty(), "Test video not found");
   const QString missing = QStringLiteral("/nonexistent/trickplay-preview.mp4");

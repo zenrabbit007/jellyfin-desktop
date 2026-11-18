@@ -237,7 +237,12 @@ bool TrickplayWorker::initializeMpv(QString& error)
   mpv_set_option_string(mpv, "input-default-bindings", "no");
   mpv_set_option_string(mpv, "input-vo-keyboard", "no");
   mpv_set_option_string(mpv, "sub-auto", "no");
-  mpv_set_option_string(mpv, "hwdec", "no");
+  // A preview decodes up to a whole keyframe interval to reach one frame, and on
+  // 4K that decode outranks everything else. Copy-back mode keeps the frames in
+  // system memory, which the image output needs, and measured about three times
+  // faster than software decoding on 4K HEVC. The "safe" variant leaves codecs
+  // and devices that are known to be broken on the software decoder.
+  mpv_set_option_string(mpv, "hwdec", "auto-copy-safe");
   mpv_set_option_string(mpv, "demuxer-mkv-probe-start-time", "no");
 
   // Previews share the connection with playback, so they must not read ahead:
@@ -249,8 +254,9 @@ bool TrickplayWorker::initializeMpv(QString& error)
   mpv_set_option_string(mpv, "demuxer-max-back-bytes", "1MiB");
 
   // A 400px thumbnail does not need the full decoder: keep the preview cheap
-  // so it cannot starve the player of CPU while it decodes.
-  mpv_set_option_string(mpv, "vd-lavc-threads", "2");
+  // so it cannot starve the player of CPU while it decodes. Two threads were
+  // half as fast as four on 4K, while more than four made it slower again.
+  mpv_set_option_string(mpv, "vd-lavc-threads", "4");
   mpv_set_option_string(mpv, "vd-lavc-skiploopfilter", "all");
   mpv_set_option_string(mpv, "msg-level", "all=error");
   if (!m_userAgent.isEmpty())
@@ -275,6 +281,15 @@ bool TrickplayWorker::initializeMpv(QString& error)
   }
 
   m_mpv = mpv;
+
+  if (m_logTimings) {
+    char* hwdec = nullptr;
+    if (mpv_get_property(mpv, "hwdec-current", MPV_FORMAT_STRING, &hwdec) >= 0 && hwdec) {
+      qDebug() << "Trickplay preview decoder:" << hwdec;
+      mpv_free(hwdec);
+    }
+  }
+
   return true;
 }
 
@@ -289,8 +304,10 @@ bool TrickplayWorker::applyScale(int width)
     return true;
 
   // The image VO writes full-size frames by default. Downscale them to keep
-  // the thumbnails (and the base64 payload sent to the web client) small.
-  const QString filter = QStringLiteral("scale=%1:-2:flags=bilinear").arg(width);
+  // the thumbnails (and the base64 payload sent to the web client) small. The
+  // box filter costs the same as bilinear here and does not alias on the detail
+  // a 4K source loses when it is shrunk to 400px.
+  const QString filter = QStringLiteral("scale=%1:-2:flags=area").arg(width);
   const int rc = mpv_set_property_string(m_mpv, "vf", filter.toUtf8().constData());
 
   if (rc < 0) {
@@ -548,6 +565,10 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
   if (isCancelled(id))
     return;
 
+  // A cheap frame for this position is already on screen; the exact one is the
+  // only thing left, so the keyframe seek below would be repeated for nothing.
+  bool haveCheapFrame = false;
+
   if (const Thumbnail* cached = m_cache.object(cacheKey)) {
     if (cached->finalFrame) {
       emit ready(id, cacheKey, dataUrl(cached->jpeg), cached->width, cached->height, true,
@@ -561,6 +582,8 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
                  cached->positionMs);
       return;
     }
+
+    haveCheapFrame = true;
   }
 
   QString error;
@@ -605,44 +628,46 @@ void TrickplayWorker::generate(quint64 id, const QString& url, qint64 positionMs
   int frameWidth = 0;
   int frameHeight = 0;
 
-  if (!seekAndCapture(id, positionMs, SeekMode::Keyframe, jpeg, frameWidth, frameHeight, error)) {
-    // A failed seek can unload the file (for example when it lands on the very
-    // end), so the next request has to load it again.
-    m_loadedUrl.clear();
-    if (!isCancelled(id))
-      emit failed(id, cacheKey, error);
-    return;
-  }
-
-  const qint64 keyframeMs = timer.elapsed();
-  const double landedMs = currentPositionSeconds() * 1000.0;
-  const qint64 keyframePositionMs = frameTimeMs(landedMs, positionMs);
-
-  // Keyframe seeking lands on the previous keyframe, which is up to one
-  // keyframe interval early. When that is close enough the frame is already
-  // the one the exact seek would produce, so the expensive pass is skipped.
-  const bool exactEnough = landedMs >= 0 && qAbs(landedMs - positionMs) <= kRefineToleranceMs;
-
-  if (exactEnough) {
-    if (m_logTimings) {
-      qDebug() << "Trickplay frame ready at" << positionMs << "ms: load" << loadMs << "ms, keyframe"
-               << keyframeMs << "ms, exact (same keyframe)";
+  if (!haveCheapFrame) {
+    if (!seekAndCapture(id, positionMs, SeekMode::Keyframe, jpeg, frameWidth, frameHeight, error)) {
+      // A failed seek can unload the file (for example when it lands on the very
+      // end), so the next request has to load it again.
+      m_loadedUrl.clear();
+      if (!isCancelled(id))
+        emit failed(id, cacheKey, error);
+      return;
     }
-    deliver(id, cacheKey, jpeg, frameWidth, frameHeight, true, keyframePositionMs);
-    return;
+
+    const qint64 keyframeMs = timer.elapsed();
+    const double landedMs = currentPositionSeconds() * 1000.0;
+    const qint64 keyframePositionMs = frameTimeMs(landedMs, positionMs);
+
+    // Keyframe seeking lands on the previous keyframe, which is up to one
+    // keyframe interval early. When that is close enough the frame is already
+    // the one the exact seek would produce, so the expensive pass is skipped.
+    const bool exactEnough = landedMs >= 0 && qAbs(landedMs - positionMs) <= kRefineToleranceMs;
+
+    if (exactEnough) {
+      if (m_logTimings) {
+        qDebug() << "Trickplay frame ready at" << positionMs << "ms: load" << loadMs << "ms, keyframe"
+                 << keyframeMs << "ms, exact (same keyframe)";
+      }
+      deliver(id, cacheKey, jpeg, frameWidth, frameHeight, true, keyframePositionMs);
+      return;
+    }
+
+    if (m_logTimings) {
+      qDebug() << "Trickplay frame at" << positionMs << "ms from keyframe" << landedMs << "ms: load"
+               << loadMs << "ms, keyframe" << keyframeMs << "ms" << (refine ? "" : ", no refine");
+    }
+
+    deliver(id, cacheKey, jpeg, frameWidth, frameHeight, false, keyframePositionMs);
+
+    // A speculative request is answered by the cheap frame; the position it
+    // guessed may never be looked at, so decoding up to it would be wasted.
+    if (!refine)
+      return;
   }
-
-  if (m_logTimings) {
-    qDebug() << "Trickplay frame at" << positionMs << "ms from keyframe" << landedMs << "ms: load"
-             << loadMs << "ms, keyframe" << keyframeMs << "ms" << (refine ? "" : ", no refine");
-  }
-
-  deliver(id, cacheKey, jpeg, frameWidth, frameHeight, false, keyframePositionMs);
-
-  // A speculative request is answered by the cheap frame; the position it
-  // guessed may never be looked at, so decoding up to it would be wasted.
-  if (!refine)
-    return;
 
   if (isCancelled(id))
     return;

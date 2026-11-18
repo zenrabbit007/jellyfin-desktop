@@ -17,6 +17,16 @@ const PREFETCH_DELAY_MS = 350;
 // Sweeping the seek bar crosses many buckets. Waiting for the pointer to slow
 // down turns that into one or two seeks instead of one per bucket.
 const HOVER_REQUEST_DELAY_MS = 120;
+// A 4K frame costs a GOP of reading and decoding, so a sweep that would cross it
+// is worth waiting out for longer than on a 1080p stream.
+const HEAVY_HOVER_REQUEST_DELAY_MS = 260;
+// The keyframe frame is already on screen, so the exact one is only worth its
+// own seek once the pointer has settled on the position.
+const REFINE_DELAY_MS = 300;
+// At or above these the stream is expensive enough that the extra frames around
+// the pointer cost more than they save.
+const HEAVY_HEIGHT = 1440;
+const HEAVY_BITRATE = 25000000;
 // The worker answers every request it receives, but a lost answer must not block
 // previews for good. This has to stay above the worker's own load + seek budget
 // (30s + 15s), otherwise big/slow files get superseded while they are still
@@ -45,6 +55,18 @@ function isPreviewEnabled() {
     // Client Settings > Video > Seek Bar Previews. Missing settings (older
     // configs) keep the feature on.
     return window.jmpInfo?.settings?.video?.trickplay_preview !== false;
+}
+
+// A 4K or high-bitrate stream makes every preview read a whole GOP off the
+// server and decode it, which is more than the guesses around the pointer are
+// worth. MediaSourceInfo describes what is actually playing.
+function isExpensiveSource(mediaSource) {
+    const streams = Array.isArray(mediaSource?.MediaStreams) ? mediaSource.MediaStreams : [];
+    const video = streams.find(stream => stream?.Type === 'Video');
+    const height = video?.Height || mediaSource?.Height || 0;
+    const bitrate = video?.BitRate || mediaSource?.Bitrate || 0;
+
+    return height >= HEAVY_HEIGHT || bitrate >= HEAVY_BITRATE;
 }
 
 function preferServerTrickplay() {
@@ -142,6 +164,7 @@ class trickplayPlugin {
         this.inFlight = null;
         this.prefetchTimer = undefined;
         this.hoverTimer = undefined;
+        this.refineTimer = undefined;
         this.warnedNoInfo = false;
         this.loggedFailures = new Set();
         this.loggedItem = null;
@@ -374,7 +397,8 @@ class trickplayPlugin {
 
         this.noPreviewReason = null;
 
-        const mediaSourceId = state.MediaSource?.Id || item.Id;
+        const mediaSource = state.MediaSource;
+        const mediaSourceId = mediaSource?.Id || item.Id;
         const durationMs = durationTicks / 10000;
         const interval = durationMs <= SHORT_VIDEO_MS
             ? SHORT_VIDEO_INTERVAL_MS
@@ -386,6 +410,7 @@ class trickplayPlugin {
             mediaSourceId,
             interval,
             durationMs,
+            heavy: isExpensiveSource(mediaSource),
             cacheKey: (item.ServerId || '') + '|' + item.Id + '|' + mediaSourceId
         };
     }
@@ -510,8 +535,8 @@ class trickplayPlugin {
 
             if (cached.final === false) {
                 // This frame came from the keyframe before the position. Ask
-                // again now that the pointer came to rest here.
-                this.scheduleHoverRequest(info, bucket, key);
+                // for the exact one now that the pointer came to rest here.
+                this.scheduleRefine(info, bucket, key);
             } else {
                 this.schedulePrefetch(info, bucket);
             }
@@ -562,11 +587,40 @@ class trickplayPlugin {
                 return;
             }
 
-            this.requestThumbnail(info, bucket, key, false);
-        }, HOVER_REQUEST_DELAY_MS);
+            // The cheap keyframe frame is asked for first. The exact frame
+            // decodes from that keyframe to the position -- a whole GOP on a
+            // 4K stream -- and is only worth it once the pointer stops.
+            this.requestThumbnail(info, bucket, key, false, false);
+        }, info.heavy ? HEAVY_HOVER_REQUEST_DELAY_MS : HOVER_REQUEST_DELAY_MS);
+    }
+
+    scheduleRefine(info, bucket, key) {
+        this.cancelRefine();
+        this.refineTimer = window.setTimeout(() => {
+            this.refineTimer = undefined;
+
+            if (!this.hover || this.hover.key !== key) {
+                return;
+            }
+
+            const cached = this.cache.get(key);
+            if (cached && cached.final !== false) {
+                return;
+            }
+
+            this.requestThumbnail(info, bucket, key, false, true);
+        }, REFINE_DELAY_MS);
+    }
+
+    cancelRefine() {
+        if (this.refineTimer !== undefined) {
+            window.clearTimeout(this.refineTimer);
+            this.refineTimer = undefined;
+        }
     }
 
     cancelHoverRequest() {
+        this.cancelRefine();
         if (this.hoverTimer !== undefined) {
             window.clearTimeout(this.hoverTimer);
             this.hoverTimer = undefined;
@@ -714,6 +768,14 @@ class trickplayPlugin {
     }
 
     schedulePrefetch(info, bucket) {
+        // Around a 4K or high-bitrate position every guess opens the stream at
+        // another byte offset and reads a GOP, and the pointer usually never
+        // lands there. The frame actually under the pointer is enough.
+        if (info.heavy) {
+            this.prefetchQueue = [];
+            return;
+        }
+
         // Fill the frames around the hovered position so moving the pointer --
         // or dragging the slider -- finds them already cached.
         const queue = [];
@@ -782,7 +844,7 @@ class trickplayPlugin {
         this.requestThumbnail(next.info, next.bucket, next.key, true);
     }
 
-    requestThumbnail(info, bucket, key, background) {
+    requestThumbnail(info, bucket, key, background, refine = !background) {
         // A worker that cannot read this item would otherwise be asked again
         // for every bucket the pointer crosses.
         if (this.failedItems.has(info.cacheKey)) {
@@ -793,7 +855,7 @@ class trickplayPlugin {
             if (this.cache.has(key) || this.pending.has(key)) {
                 return;
             }
-            this.dispatchThumbnail(info, bucket, key, true);
+            this.dispatchThumbnail(info, bucket, key, true, false);
             return;
         }
 
@@ -845,10 +907,10 @@ class trickplayPlugin {
 
         this.lastRequestedKey = key;
         this.inFlight = { itemKey: info.cacheKey, key, startedAt: performance.now() };
-        this.dispatchThumbnail(info, bucket, key, false);
+        this.dispatchThumbnail(info, bucket, key, false, refine);
     }
 
-    dispatchThumbnail(info, bucket, key, background) {
+    dispatchThumbnail(info, bucket, key, background, refine) {
         const timer = window.setTimeout(() => {
             this.pending.delete(key);
             if (this.inFlight?.key === key) {
@@ -860,9 +922,7 @@ class trickplayPlugin {
         this.pending.set(key, { timer, background });
 
         try {
-            // A background frame is only a guess at where the pointer goes
-            // next, so it is not worth decoding up to that position.
-            this.api.trickplay.requestThumbnail(info.url, bucket, REQUEST_WIDTH, key, !background);
+            this.api.trickplay.requestThumbnail(info.url, bucket, REQUEST_WIDTH, key, refine);
         } catch (error) {
             console.error('Trickplay Preview: request failed', error);
             window.clearTimeout(timer);
@@ -888,7 +948,7 @@ class trickplayPlugin {
             return;
         }
 
-        this.requestThumbnail(hover.info, splitKey(hover.key).bucket, hover.key, false);
+        this.requestThumbnail(hover.info, splitKey(hover.key).bucket, hover.key, false, false);
     }
 
     onThumbnailReady(cacheKey, dataUrl, width, height, finalFrame, framePositionMs) {
@@ -900,19 +960,28 @@ class trickplayPlugin {
         this.lastFrame = { itemKey, thumbnail: this.cache.get(cacheKey) };
         this.producedItems.add(itemKey);
 
-        // The frame at the keyframe before the position arrives first. The
-        // exact frame is still being generated, so the request stays pending
-        // and the background queue stays paused until it is delivered.
+        // The frame at the keyframe before the position arrives first and
+        // answers the request that asked for it: an interactive hover now asks
+        // for the cheap frame first, and the exact one is a separate request
+        // once the pointer has settled.
         if (!final) {
             // A speculative request asked for this frame only, so it is done
             // and must not hold the queue back.
             if (this.pending.get(cacheKey)?.background) {
                 this.clearPending(cacheKey);
                 this.pumpPrefetch();
+                return;
             }
+
+            this.clearPending(cacheKey);
+            this.dropSupersededRequest();
 
             if (this.hover?.key === cacheKey) {
                 this.refreshBubble();
+                this.scheduleRefine(this.hover.info, bucket, cacheKey);
+            } else {
+                this.requestHoveredThumbnail();
+                this.pumpPrefetch();
             }
             return;
         }
